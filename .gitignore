@@ -1,0 +1,18 @@
+# Runtime outputs
+logs/
+projects/
+
+# Local configuration with tenant/client/certificate values
+config.xml
+
+# PowerShell/system noise
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# SQLite databases and transient files
+*.db
+*.db-shm
+*.db-wal
+

@@ -1,0 +1,624 @@
+# Migration SharePoint
+
+Script PowerShell de migration de fichiers depuis un dossier local vers une bibliotheque SharePoint Online avec `PnP.PowerShell`.
+
+Le script parcourt recursivement un dossier source, cree les dossiers manquants dans SharePoint, envoie les fichiers, journalise les operations et peut generer un inventaire des fichiers non migrables selon les extensions bloquees au niveau du tenant.
+
+## Structure
+
+```text
+.
+|-- main.ps1
+|-- config.xml
+|-- SCENARIO.md
+|-- functions/
+|   |-- Convert-ToSharePointRelativePath.ps1
+|   |-- Ensure-PnPPowerShell.ps1
+|   |-- Ensure-RemoteFolder.ps1
+|   |-- Format-FileSize.ps1
+|   |-- Get-RequiredValue.ps1
+|   |-- Get-TenantBlockedExtensions.ps1
+|   |-- Initialize-Log.ps1
+|   |-- Join-SharePointPath.ps1
+|   |-- MigrationWorkflow.ps1
+|   |-- New-MigrationInventory.ps1
+|   |-- ProjectDatabase.ps1
+|   |-- Write-Log.ps1
+|   `-- Write-Step.ps1
+|-- logs/
+`-- projects/
+```
+
+## Prerequis
+
+- PowerShell 7 recommande.
+- Module PowerShell `PnP.PowerShell`.
+- Module PowerShell `PSSQLite` pour le mode projet avec base `.db`.
+- Application Azure AD / Entra ID autorisee a acceder au site SharePoint.
+- Certificat installe localement et associe a l'application.
+- Droits suffisants sur la bibliotheque SharePoint cible.
+
+Installation des modules si necessaire:
+
+```powershell
+Install-Module PnP.PowerShell -Scope CurrentUser
+Install-Module PSSQLite -Scope CurrentUser
+```
+
+## Configuration
+
+La configuration se fait dans `config.xml`.
+
+```xml
+<Configuration>
+    <Authentication>
+        <TenantId>...</TenantId>
+        <ClientId>...</ClientId>
+        <CertificateThumbprint>...</CertificateThumbprint>
+    </Authentication>
+
+    <Source>
+        <LocalPath>C:\Chemin\Vers\Dossier</LocalPath>
+    </Source>
+
+    <Destination>
+        <SiteUrl>https://contoso.sharepoint.com/sites/Projet</SiteUrl>
+        <Library>Shared Documents</Library>
+        <Folder>SousDossierOptionnel</Folder>
+    </Destination>
+
+    <Logging>
+        <LogDirectory>.\logs</LogDirectory>
+    </Logging>
+
+    <Migration>
+        <HashMode>SHA256</HashMode>
+        <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
+        <MaxTotalErrors>1000</MaxTotalErrors>
+    </Migration>
+
+    <Exclusions>
+        <Files>
+            <Pattern>*.tmp</Pattern>
+            <Pattern>Thumbs.db</Pattern>
+        </Files>
+        <Folders>
+            <Pattern>node_modules</Pattern>
+            <Pattern>archive/*</Pattern>
+        </Folders>
+    </Exclusions>
+</Configuration>
+```
+
+Champs importants:
+
+- `Authentication.TenantId`: identifiant du tenant Microsoft 365.
+- `Authentication.ClientId`: identifiant de l'application Entra ID.
+- `Authentication.CertificateThumbprint`: empreinte du certificat utilise pour l'authentification.
+- `Source.LocalPath`: dossier local a migrer.
+- `Destination.SiteUrl`: URL du site SharePoint cible.
+- `Destination.Library`: bibliotheque cible. Attention a utiliser le nom attendu dans l'URL SharePoint, par exemple `Shared Documents`.
+- `Destination.Folder`: dossier cible optionnel dans la bibliotheque.
+- `Logging.LogDirectory`: dossier de sortie des journaux.
+- `Migration.HashMode`: mode de detection des modifications locales. Valeurs autorisees: `SHA256`, `Quick`, `None`.
+- `Migration.MaxAttemptsPerFile`: nombre maximum de tentatives d'upload par fichier. Mettre `0` pour desactiver la limite.
+- `Migration.MaxTotalErrors`: nombre maximum d'erreurs pendant une execution de migration. Mettre `0` pour desactiver l'arret automatique.
+- `Exclusions.Files.Pattern`: motifs de fichiers a exclure. Les motifs sont compares au nom du fichier et au chemin relatif.
+- `Exclusions.Folders.Pattern`: motifs de dossiers a exclure. Les motifs sont compares aux segments de dossiers et au chemin relatif du dossier.
+
+## Utilisation rapide
+
+Afficher l'aide integree:
+
+```powershell
+.\main.ps1 -Help
+```
+
+Lancement standard sans projet:
+
+```powershell
+.\main.ps1
+```
+
+Les journaux sont crees dans le dossier configure, par defaut `.\logs`.
+
+Pour une migration repriseable, utiliser le workflow projet decrit ci-dessous.
+
+## Workflow projet avec reprise
+
+Le mode projet permet de rendre la migration repriseable apres un crash, une fermeture de session ou une erreur reseau. Chaque projet contient sa propre configuration, ses logs, ses rapports et une base SQLite `migration.db`.
+
+Creation d'un projet:
+
+```powershell
+.\main.ps1 -NewProject -ProjectName "Migration-Lunii" -ConfigPath .\config.xml
+```
+
+Cette commande est obligatoire avant d'utiliser `-Project "Migration-Lunii"`. Si le projet n'existe pas encore, les commandes `-Inventory`, `-Migrate`, `-Resume`, `-Status` et `-ExportReport` ne peuvent pas le retrouver.
+
+Cela cree:
+
+```text
+projects/
+`-- Migration-Lunii/
+    |-- project.json
+    |-- config.xml
+    |-- migration.db
+    |-- logs/
+    `-- reports/
+```
+
+Generation de l'inventaire dans la base `.db`:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Inventory
+```
+
+Inventaire delta, sans traiter les fichiers supprimes:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory
+```
+
+Inventaire delta en marquant aussi les fichiers supprimes:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory -IncludeDeleted
+```
+
+Migration avec suppression SharePoint des fichiers marques `MissingLocalFile`:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate -DeleteRemoteMissing
+```
+
+Controle des changements sans modifier les statuts:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -CheckChanges
+```
+
+Controle des changements en listant aussi les fichiers supprimes:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -CheckChanges -IncludeDeleted
+```
+
+Migration depuis l'inventaire persistant:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate
+```
+
+Reprise apres interruption:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Resume
+```
+
+Afficher l'etat courant:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Status
+```
+
+Exporter un rapport CSV:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -ExportReport
+```
+
+Cette commande genere quatre fichiers dans `reports/`:
+
+- `migration_report_yyyyMMdd_HHmmss.csv`: detail de tous les fichiers de la table `Files`.
+- `migration_summary_yyyyMMdd_HHmmss.csv`: resume par statut avec le nombre de fichiers et la taille totale.
+- `migration_errors_yyyyMMdd_HHmmss.csv`: fichiers en erreur, uniquement `Failed` et `MissingLocalFile`.
+- `migration_changes_yyyyMMdd_HHmmss.csv`: fichiers dont le hash a change entre deux inventaires.
+
+Controle apres migration:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory
+.\main.ps1 -Project "Migration-Lunii" -ExportReport
+```
+
+Ce delta inventaire permet de detecter les fichiers nouveaux ou modifies localement pendant ou apres la migration. Par defaut, il ignore les fichiers supprimes. Ajouter `-IncludeDeleted` pour les marquer `MissingLocalFile`.
+
+Pour etre iso avec la source locale, lancer ensuite:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate -DeleteRemoteMissing
+```
+
+Cette commande supprime dans SharePoint les fichiers marques `MissingLocalFile`, puis les passe en `DeletedRemote`.
+
+Attention: `-CheckChanges` est uniquement un controle en lecture. Il genere un rapport mais ne met pas a jour `FileHash`, ne remet pas les fichiers modifies en `Pending` et ne prepare pas leur migration. Si `-CheckChanges` detecte un fichier `Modified`, executer ensuite:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory
+.\main.ps1 -Project "Migration-Lunii" -Migrate
+```
+
+Apres ce delta et cette migration, un nouveau `-CheckChanges` ne doit plus remonter le fichier si le contenu local n'a pas encore change.
+
+Si un fichier deja `Uploaded` ou `SkippedExists` a change, son hash ne correspond plus et le script le remet en `Pending`. `LastError` n'est pas utilise pour signaler ce cas: le changement est suivi par `HashChanged`, `PreviousFileHash`, `FileHash` et `LastHashChangedAt`.
+
+Le rapport dedie est:
+
+```text
+migration_changes_yyyyMMdd_HHmmss.csv
+```
+
+Il contient les fichiers modifies detectes lors du dernier `-Inventory` ou `-DeltaInventory`:
+
+```text
+HashChanged = 1
+```
+
+Dans le rapport complet `migration_report_yyyyMMdd_HHmmss.csv`, filtrer:
+
+```text
+HashChanged = 1
+```
+
+Requete SQLite equivalente:
+
+```sql
+SELECT RelativePath, FullPath, Status, SizeBytes, LastWriteTimeUtc,
+       PreviousFileHash, FileHash, LastHashChangedAt
+FROM Files
+WHERE HashChanged = 1
+ORDER BY LastHashChangedAt DESC, RelativePath;
+```
+
+Purger les anciens rapports:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -PurgeReports -ReportRetentionDays 30
+```
+
+Remettre les fichiers `Failed` en `Pending`:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -ResetFailed
+```
+
+Statuts stockes en base:
+
+- `Pending`: fichier pret a migrer.
+- `Uploading`: upload en cours au moment de la derniere mise a jour.
+- `Uploaded`: upload reussi.
+- `Failed`: erreur lors de l'upload.
+- `BlockedExtension`: extension bloquee par le tenant.
+- `SkippedExists`: fichier deja present dans SharePoint et non ecrase.
+- `MissingLocalFile`: fichier present dans l'inventaire mais introuvable localement.
+- `DeletedRemote`: fichier supprime de SharePoint avec `-DeleteRemoteMissing`.
+
+Au lancement d'une migration projet, les fichiers restes en `Uploading` sont remis en `Pending`. Cela permet de reprendre proprement apres une interruption pendant un upload.
+
+## Base de donnees projet
+
+Chaque projet contient une base SQLite:
+
+```text
+projects/<NomProjet>/migration.db
+```
+
+Cette base est la source de verite pour l'inventaire, la reprise et les rapports.
+
+### Table `ProjectMetadata`
+
+Stocke les informations generales du projet sous forme cle/valeur.
+
+- `Key`: nom de l'information.
+- `Value`: valeur associee.
+
+Exemples:
+
+- `ProjectName`: nom lisible du projet.
+- `CreatedAtUtc`: date de creation du projet.
+- `ConfigPath`: chemin du `config.xml` copie dans le dossier projet.
+
+### Table `Files`
+
+Table centrale de la migration. Une ligne correspond a un fichier local inventorie.
+
+- `Id`: identifiant interne unique du fichier dans la base.
+- `FullPath`: chemin complet du fichier local.
+- `RelativePath`: chemin relatif depuis le dossier source. Sert a reconstruire l'arborescence SharePoint.
+- `Extension`: extension normalisee du fichier, sans point.
+- `FileHash`: hash SHA256 du fichier local au moment de l'inventaire. Sert a detecter les modifications locales entre deux inventaires.
+- `PreviousFileHash`: hash precedent connu avant la derniere mise a jour du hash.
+- `HashChanged`: vaut `1` si un changement de hash a ete detecte entre deux inventaires.
+- `LastHashChangedAt`: date de derniere detection d'un changement de hash.
+- `SizeBytes`: taille du fichier en octets.
+- `LastWriteTimeUtc`: date de derniere modification locale au moment de l'inventaire.
+- `TargetFolder`: dossier SharePoint cible.
+- `TargetUrl`: URL serveur-relative complete du fichier cible SharePoint.
+- `Status`: etat courant du fichier dans la migration.
+- `AttemptCount`: nombre de tentatives d'upload.
+- `LastError`: derniere erreur connue pour ce fichier.
+- `LastInventorySeenAt`: date du dernier inventaire ou le fichier a ete revu sur le disque.
+- `CreatedAt`: date d'ajout de la ligne dans la base.
+- `UpdatedAt`: date de derniere mise a jour de la ligne.
+- `UploadedAt`: date d'upload reussi, si applicable.
+
+Statuts possibles:
+
+- `Pending`: fichier pret a etre migre.
+- `Uploading`: fichier en cours de traitement. Si le script s'arrete brutalement, ce statut est remis a `Pending` au prochain `-Migrate` ou `-Resume`.
+- `Uploaded`: fichier envoye avec succes.
+- `Failed`: erreur lors de l'upload.
+- `BlockedExtension`: fichier bloque car son extension est interdite par le tenant.
+- `SkippedExists`: fichier deja present dans SharePoint et non ecrase.
+- `MissingLocalFile`: fichier present dans l'inventaire mais introuvable sur le disque au moment de la migration.
+- `DeletedRemote`: fichier absent localement et supprime de SharePoint avec `-DeleteRemoteMissing`.
+
+Quand l'inventaire est relance, la base n'est pas ecrasee:
+
+- les nouveaux fichiers sont ajoutes;
+- les fichiers existants sont mis a jour;
+- les fichiers disparus du disque sont marques `MissingLocalFile`;
+- les fichiers deja `Uploaded` ou `SkippedExists` restent dans ce statut si leur hash SHA256 n'a pas change;
+- si un fichier deja migre a ete modifie localement, son hash change et il repasse en `Pending`;
+- `HashChanged` est remis a `0` au debut d'un nouvel `-Inventory` ou `-DeltaInventory`, puis repasse a `1` uniquement pour les changements detectes pendant cette execution.
+
+Modes de hash:
+
+- `SHA256`: le plus fiable, lit le contenu complet du fichier.
+- `Quick`: plus rapide, base la detection sur la taille et la date de derniere modification UTC.
+- `None`: ne calcule pas de hash. La detection fine des modifications locales est desactivee.
+
+### Table `Runs`
+
+Trace les executions du projet.
+
+- `Id`: identifiant interne de l'execution.
+- `Mode`: type d'execution, par exemple `Inventory`, `Migrate` ou `Resume`.
+- `StartedAt`: date de debut.
+- `FinishedAt`: date de fin, si l'execution s'est terminee proprement.
+- `Result`: resultat de l'execution, par exemple `Running`, `Success` ou `Failed`.
+- `Message`: resume ou message d'erreur associe.
+
+Cette table sert surtout a auditer les lancements et a comprendre l'historique d'un projet.
+
+## Modes disponibles
+
+Le script contient les options suivantes:
+
+- `-WhatIf`: simuler les uploads et suppressions pour une migration ou reprise, sans modifier SharePoint.
+- `-Help`: afficher l'aide integree.
+- `-Overwrite`: autoriser l'ecrasement des fichiers existants.
+- `-Inventory`: generer uniquement un inventaire. Avec `-Project`, l'inventaire est stocke dans `migration.db`.
+- `-DeltaInventory`: mettre a jour l'inventaire uniquement pour les fichiers nouveaux ou modifies.
+- `-CheckChanges`: generer un rapport de changements sans modifier les statuts en base.
+- `-IncludeDeleted`: avec `-DeltaInventory` ou `-CheckChanges`, traiter aussi les fichiers disparus.
+- `-DeleteRemoteMissing`: avec `-Migrate` ou `-Resume`, supprimer dans SharePoint les fichiers marques `MissingLocalFile`.
+- `-ConfigPath`: utiliser un autre fichier de configuration.
+- `-NewProject`: creer un nouveau projet.
+- `-ProjectName`: nom du projet a creer.
+- `-Project`: nom ou chemin du projet existant.
+- `-Migrate`: migrer les fichiers `Pending` depuis la base projet.
+- `-Resume`: reprendre les fichiers `Pending`, `Failed` et `Uploading`.
+- `-Status`: afficher le bilan de la base projet.
+- `-ExportReport`: exporter les CSV de detail, resume par statut, erreurs et modifications.
+- `-PurgeReports`: supprimer les rapports CSV plus anciens que `-ReportRetentionDays`.
+- `-ReportRetentionDays`: nombre de jours a conserver lors de `-PurgeReports`. Defaut: `30`.
+- `-ResetFailed`: remettre les fichiers `Failed` en `Pending`, remettre leur `AttemptCount` a `0` et vider `LastError`.
+- `-ExcludeFile`: exclure des fichiers par motif, par exemple `-ExcludeFile *.tmp,Thumbs.db`.
+- `-ExcludeFolder`: exclure des dossiers par motif, par exemple `-ExcludeFolder node_modules,archive/*`.
+
+## Fonctionnement d'une migration
+
+1. Charge toutes les fonctions du dossier `functions`.
+2. Lit et valide les valeurs obligatoires de `config.xml`.
+3. Initialise un fichier de log.
+4. Verifie que le chemin source existe et correspond a un dossier.
+5. Construit le chemin SharePoint cible.
+6. Verifie et importe le module `PnP.PowerShell`.
+7. Se connecte a SharePoint avec certificat.
+8. Recupere les extensions bloquees par le tenant.
+9. Valide que la bibliotheque ou le dossier SharePoint cible est accessible.
+10. Parcourt tous les fichiers locaux en appliquant les exclusions.
+11. Cree les dossiers distants manquants.
+12. Verifie l'existence du fichier cible.
+13. Upload le fichier ou l'ignore selon la configuration.
+14. Ecrit un bilan final dans le log.
+
+Certaines commandes projet ne suivent pas ce flux complet:
+
+- `-NewProject` cree seulement la structure projet et la base SQLite.
+- `-Status` lit uniquement la base projet.
+- `-ExportReport` exporte les donnees de la table `Files`, un resume par statut, les erreurs et les modifications detectees.
+- `-CheckChanges` lit la base et le disque local, puis genere un rapport sans connexion SharePoint et sans modifier les statuts.
+- `-Migrate` et `-Resume` respectent `Migration.MaxAttemptsPerFile` et `Migration.MaxTotalErrors`.
+
+## Inventaire
+
+Le mode inventaire sert a analyser les fichiers sans effectuer d'upload.
+
+Sans projet:
+
+```powershell
+.\main.ps1 -Inventory
+```
+
+Le script produit un journal dedie listant les fichiers bloques par extension tenant.
+
+Avec projet:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Inventory
+```
+
+Le script alimente la base `migration.db`, notamment la table `Files`, avec le chemin local, le chemin relatif, la cible SharePoint, la taille, l'extension et le statut de chaque fichier.
+
+Dans les deux cas, quand `Inventory` est actif, le script:
+
+- se connecte a SharePoint;
+- recupere les extensions bloquees;
+- valide la destination SharePoint;
+- analyse les fichiers locaux;
+- applique les exclusions;
+- n'effectue aucun upload.
+
+## Delta inventaire
+
+Le delta inventaire sert a verifier uniquement ce qui a change depuis le dernier inventaire connu.
+
+Commande standard:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory
+```
+
+Comportement:
+
+- les nouveaux fichiers sont ajoutes en base;
+- les fichiers dont le hash a change sont mis a jour;
+- les fichiers modifies apparaissent dans `migration_changes_yyyyMMdd_HHmmss.csv` apres `-ExportReport`;
+- les fichiers inchanges ne sont pas reecrits, seule leur date de dernier passage inventaire est mise a jour;
+- les fichiers supprimes sont ignores par defaut.
+
+Pour traiter aussi les suppressions:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory -IncludeDeleted
+```
+
+Avec `-IncludeDeleted`, les fichiers presents en base mais absents du disque sont marques `MissingLocalFile`.
+
+Pour synchroniser aussi les suppressions vers SharePoint:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate -DeleteRemoteMissing
+```
+
+Comportement:
+
+- traite uniquement les fichiers deja marques `MissingLocalFile`;
+- supprime le fichier correspondant dans SharePoint s'il existe;
+- marque le fichier en `DeletedRemote` apres suppression ou s'il est deja absent de SharePoint;
+- respecte `Migration.MaxAttemptsPerFile` et `Migration.MaxTotalErrors`;
+- reste optionnel pour eviter les suppressions distantes accidentelles.
+
+## Controle des changements
+
+`-CheckChanges` sert a observer les changements sans preparer de migration.
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -CheckChanges
+```
+
+Comportement:
+
+- compare les fichiers locaux avec les hash stockes en base;
+- detecte les fichiers nouveaux;
+- detecte les fichiers modifies si `HashMode` n'est pas `None`;
+- ne modifie pas les statuts `Pending`, `Uploaded`, `SkippedExists`, etc.;
+- ne se connecte pas a SharePoint;
+- genere un rapport `migration_checkchanges_yyyyMMdd_HHmmss.csv`.
+
+Pour inclure les suppressions dans ce rapport:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -CheckChanges -IncludeDeleted
+```
+
+## Exclusions
+
+Les exclusions peuvent etre declarees dans `config.xml` ou passees en ligne de commande.
+
+Exemples:
+
+```powershell
+.\main.ps1 -Inventory -ExcludeFile *.tmp,Thumbs.db -ExcludeFolder node_modules,archive/*
+.\main.ps1 -Project "Migration-Lunii" -Inventory -ExcludeFile *.bak
+```
+
+Les motifs de fichiers sont compares au nom du fichier et au chemin relatif. Les motifs de dossiers sont compares aux segments du chemin et au chemin relatif du dossier.
+
+## Ecrasement
+
+Par defaut, si un fichier existe deja dans SharePoint, il est ignore.
+
+Avec `-Overwrite`, le comportement est explicite: le script supprime le fichier cible existant avec `Remove-PnPFile -Force`, puis envoie le nouveau fichier avec `Add-PnPFile`.
+
+## Limites d'erreurs
+
+Les limites de migration sont configurees dans le `config.xml` du projet:
+
+```xml
+<Migration>
+    <HashMode>SHA256</HashMode>
+    <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
+    <MaxTotalErrors>1000</MaxTotalErrors>
+</Migration>
+```
+
+- `HashMode`: `SHA256`, `Quick` ou `None`.
+- `MaxAttemptsPerFile`: un fichier dont `AttemptCount` atteint cette valeur n'est plus repris par `-Migrate` ou `-Resume`.
+- `MaxTotalErrors`: si ce nombre d'erreurs est atteint pendant une execution, la migration s'arrete.
+
+Dans un projet existant, modifier le fichier:
+
+```text
+projects/<NomProjet>/config.xml
+```
+
+## Logs
+
+Les logs contiennent:
+
+- demarrage et configuration utilisee;
+- source locale;
+- destination SharePoint;
+- fichiers envoyes;
+- fichiers ignores;
+- fichiers bloques;
+- erreurs detaillees par fichier;
+- bilan final.
+
+Exemples de statuts:
+
+- `[INFO]`: information generale.
+- `[WARN]`: avertissement ou fichier ignore.
+- `[SUCCESS]`: upload reussi.
+- `[ERROR]`: erreur bloquante ou erreur fichier.
+
+## Precautions
+
+- Verifier la destination SharePoint avant execution.
+- Tester d'abord sur un petit dossier.
+- Utiliser `-Overwrite` uniquement si l'ecrasement des fichiers existants est voulu.
+- Ne pas partager `config.xml` publiquement: il contient des informations d'identification applicative.
+- S'assurer que le certificat correspondant au thumbprint est installe sur la machine.
+- Controler que le nom de bibliotheque correspond au chemin attendu par SharePoint.
+
+## Verification rapide
+
+Verifier la syntaxe du script principal:
+
+```powershell
+$tokens = $null
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\main.ps1), [ref]$tokens, [ref]$errors) > $null
+$errors
+```
+
+Verifier la syntaxe des fonctions:
+
+```powershell
+Get-ChildItem -Path .\functions -Filter *.ps1 | ForEach-Object {
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) > $null
+    $errors
+}
+```
+
+## Ameliorations possibles
+
+- Ajouter une commande pour reinitialiser uniquement certains fichiers par chemin ou statut.
+- Ajouter une option de simulation de purge des rapports avant suppression.
+- Ajouter une verification distante des fichiers deja envoyes avec comparaison de taille ou checksum si disponible.

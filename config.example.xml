@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<Configuration>
+    <Authentication>
+        <TenantId>00000000-0000-0000-0000-000000000000</TenantId>
+        <ClientId>00000000-0000-0000-0000-000000000000</ClientId>
+        <CertificateThumbprint>XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</CertificateThumbprint>
+    </Authentication>
+
+    <Source>
+        <LocalPath>C:\Chemin\Vers\DossierSource</LocalPath>
+    </Source>
+
+    <Destination>
+        <SiteUrl>https://contoso.sharepoint.com/sites/Projet</SiteUrl>
+        <Library>Shared Documents</Library>
+        <Folder></Folder>
+    </Destination>
+
+    <Logging>
+        <LogDirectory>.\logs</LogDirectory>
+    </Logging>
+
+    <Migration>
+        <HashMode>SHA256</HashMode>
+        <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
+        <MaxTotalErrors>1000</MaxTotalErrors>
+    </Migration>
+
+    <Exclusions>
+        <Files>
+            <Pattern>*.tmp</Pattern>
+            <Pattern>Thumbs.db</Pattern>
+        </Files>
+        <Folders>
+            <Pattern>node_modules</Pattern>
+            <Pattern>archive/*</Pattern>
+        </Folders>
+    </Exclusions>
+</Configuration>

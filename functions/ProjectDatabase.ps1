@@ -6,6 +6,62 @@ function Ensure-PSSQLite {
     Import-Module PSSQLite -ErrorAction Stop
 }
 
+function Enter-MigrationProjectLock {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath
+    )
+
+    $projectDirectory = Split-Path -Parent $DatabasePath
+    $lockPath = Join-Path $projectDirectory "migration.lock"
+
+    $lockSet = Get-Variable -Name MigrationSharePointProjectLocks -Scope Global -ErrorAction SilentlyContinue
+    if ($null -eq $lockSet -or $null -eq $lockSet.Value) {
+        $global:MigrationSharePointProjectLocks = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    if ($global:MigrationSharePointProjectLocks.Contains($lockPath)) {
+        throw "Le projet est deja utilise par cette execution: $projectDirectory"
+    }
+
+    try {
+        $lockStream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+
+        $metadata = "PID=$PID; StartedAtUtc=$((Get-Date).ToUniversalTime().ToString('o'))"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($metadata)
+        $lockStream.SetLength(0)
+        $lockStream.Write($bytes, 0, $bytes.Length)
+        $lockStream.Flush()
+
+        [void]$global:MigrationSharePointProjectLocks.Add($lockPath)
+
+        return ,$lockStream
+    }
+    catch [System.IO.IOException] {
+        throw "Le projet est deja utilise par une autre execution: $projectDirectory"
+    }
+}
+
+function Exit-MigrationProjectLock {
+    param(
+        [System.IO.FileStream]$LockStream
+    )
+
+    if ($null -ne $LockStream) {
+        $lockPath = $LockStream.Name
+        $LockStream.Dispose()
+
+        if ($null -ne $global:MigrationSharePointProjectLocks) {
+            [void]$global:MigrationSharePointProjectLocks.Remove($lockPath)
+        }
+    }
+}
+
 function Get-ProjectRoot {
     param(
         [string]$RootDirectory
@@ -229,12 +285,22 @@ function Start-MigrationRun {
     )
 
     $now = (Get-Date).ToUniversalTime().ToString("o")
-    Invoke-SqliteQuery `
+    return Invoke-SqliteQuery `
         -DataSource $DatabasePath `
-        -Query "INSERT INTO Runs (Mode, StartedAt, Result) VALUES (@Mode, @StartedAt, 'Running');" `
-        -SqlParameters @{ Mode = $Mode; StartedAt = $now } | Out-Null
+        -Query @"
+UPDATE Runs
+SET FinishedAt = @StartedAt,
+    Result = 'Interrupted',
+    Message = 'Execution precedente interrompue avant sa cloture'
+WHERE Result = 'Running';
 
-    return Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT last_insert_rowid();" -As "SingleValue"
+INSERT INTO Runs (Mode, StartedAt, Result)
+VALUES (@Mode, @StartedAt, 'Running');
+
+SELECT last_insert_rowid();
+"@ `
+        -SqlParameters @{ Mode = $Mode; StartedAt = $now } `
+        -As "SingleValue"
 }
 
 function Complete-MigrationRun {
@@ -267,7 +333,7 @@ function Reset-IncompleteUploads {
     $now = (Get-Date).ToUniversalTime().ToString("o")
     Invoke-SqliteQuery `
         -DataSource $DatabasePath `
-        -Query "UPDATE Files SET Status = 'Pending', LastError = 'Repris apres interruption pendant Uploading', UpdatedAt = @UpdatedAt WHERE Status = 'Uploading';" `
+        -Query "UPDATE Files SET LastError = 'Upload precedent interrompu: verification distante obligatoire avant reprise', UpdatedAt = @UpdatedAt WHERE Status = 'Uploading';" `
         -SqlParameters @{ UpdatedAt = $now } | Out-Null
 }
 
@@ -591,20 +657,46 @@ function Get-MigrationFilesToProcess {
 
         [switch]$IncludeFailed,
 
+        [int]$MaxAttemptsPerFile = 3,
+
+        [int]$AfterId = 0,
+
+        [ValidateRange(1, 100000)]
+        [int]$BatchSize = 1000
+    )
+
+    $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND AttemptCount < @MaxAttemptsPerFile" } else { "" }
+
+    return @(Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query "SELECT * FROM Files WHERE Status IN $statusFilter AND Id > @AfterId $attemptFilter ORDER BY Id LIMIT @BatchSize;" `
+        -SqlParameters @{
+            AfterId            = $AfterId
+            BatchSize          = $BatchSize
+            MaxAttemptsPerFile = $MaxAttemptsPerFile
+        } `
+        -As "PSObject")
+}
+
+function Get-MigrationFilesToProcessCount {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [switch]$IncludeFailed,
+
         [int]$MaxAttemptsPerFile = 3
     )
 
     $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND AttemptCount < @MaxAttemptsPerFile" } else { "" }
 
-    if ($MaxAttemptsPerFile -le 0) {
-        return @(Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT * FROM Files WHERE Status IN $statusFilter ORDER BY Id;" -As "PSObject")
-    }
-
-    if ($IncludeFailed) {
-        return @(Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT * FROM Files WHERE Status IN ('Pending', 'Failed', 'Uploading') AND AttemptCount < @MaxAttemptsPerFile ORDER BY Id;" -SqlParameters @{ MaxAttemptsPerFile = $MaxAttemptsPerFile } -As "PSObject")
-    }
-
-    return @(Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT * FROM Files WHERE Status IN ('Pending', 'Uploading') AND AttemptCount < @MaxAttemptsPerFile ORDER BY Id;" -SqlParameters @{ MaxAttemptsPerFile = $MaxAttemptsPerFile } -As "PSObject")
+    return [int](Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query "SELECT COUNT(*) FROM Files WHERE Status IN $statusFilter $attemptFilter;" `
+        -SqlParameters @{ MaxAttemptsPerFile = $MaxAttemptsPerFile } `
+        -As "SingleValue")
 }
 
 function Get-MigrationRemoteDeleteCandidates {

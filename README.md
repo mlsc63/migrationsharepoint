@@ -31,7 +31,7 @@ Le script parcourt recursivement un dossier source, cree les dossiers manquants 
 
 ## Prerequis
 
-- PowerShell 7 recommande.
+- PowerShell 7 obligatoire pour `-Migrate` et `-Resume` avec les uploads paralleles.
 - Module PowerShell `PnP.PowerShell`.
 - Module PowerShell `PSSQLite` pour le mode projet avec base `.db`.
 - Application Azure AD / Entra ID autorisee a acceder au site SharePoint.
@@ -44,6 +44,16 @@ Installation des modules si necessaire:
 Install-Module PnP.PowerShell -Scope CurrentUser
 Install-Module PSSQLite -Scope CurrentUser
 ```
+
+### Tests locaux
+
+Les tests de securite et de reprise utilisent Pester et une base SQLite temporaire:
+
+```powershell
+Invoke-Pester .\tests\ProjectSafety.Tests.ps1
+```
+
+Ils ne se connectent pas a SharePoint et ne modifient aucun projet existant.
 
 ## Configuration
 
@@ -75,6 +85,9 @@ La configuration se fait dans `config.xml`.
         <HashMode>SHA256</HashMode>
         <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
         <MaxTotalErrors>1000</MaxTotalErrors>
+        <ParallelUploads>4</ParallelUploads>
+        <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+        <ProcessingBatchSize>1000</ProcessingBatchSize>
     </Migration>
 
     <Exclusions>
@@ -103,6 +116,9 @@ Champs importants:
 - `Migration.HashMode`: mode de detection des modifications locales. Valeurs autorisees: `SHA256`, `Quick`, `None`.
 - `Migration.MaxAttemptsPerFile`: nombre maximum de tentatives d'upload par fichier. Mettre `0` pour desactiver la limite.
 - `Migration.MaxTotalErrors`: nombre maximum d'erreurs pendant une execution de migration. Mettre `0` pour desactiver l'arret automatique.
+- `Migration.ParallelUploads`: nombre d'uploads simultanes, entre `1` et `16`. Commencer avec `4`.
+- `Migration.AssumeDestinationEmpty`: si `true`, ne controle pas l'existence distante avant chaque upload.
+- `Migration.ProcessingBatchSize`: nombre de lignes SQLite chargees en memoire par page. Defaut: `1000`.
 - `Exclusions.Files.Pattern`: motifs de fichiers a exclure. Les motifs sont compares au nom du fichier et au chemin relatif.
 - `Exclusions.Folders.Pattern`: motifs de dossiers a exclure. Les motifs sont compares aux segments de dossiers et au chemin relatif du dossier.
 
@@ -286,7 +302,7 @@ Remettre les fichiers `Failed` en `Pending`:
 Statuts stockes en base:
 
 - `Pending`: fichier pret a migrer.
-- `Uploading`: upload en cours au moment de la derniere mise a jour.
+- `Uploading`: tentative commencee, mais resultat final pas encore confirme dans SQLite.
 - `Uploaded`: upload reussi.
 - `Failed`: erreur lors de l'upload.
 - `BlockedExtension`: extension bloquee par le tenant.
@@ -294,7 +310,9 @@ Statuts stockes en base:
 - `MissingLocalFile`: fichier present dans l'inventaire mais introuvable localement.
 - `DeletedRemote`: fichier supprime de SharePoint avec `-DeleteRemoteMissing`.
 
-Au lancement d'une migration projet, les fichiers restes en `Uploading` sont remis en `Pending`. Cela permet de reprendre proprement apres une interruption pendant un upload.
+Au lancement d'une reprise, les fichiers restes en `Uploading` conservent ce statut. Le script force alors un controle distant, meme avec `AssumeDestinationEmpty=true`, afin de ne pas reenvoyer aveuglement un fichier dont l'upload aurait reussi avant l'interruption.
+
+Un verrou exclusif `migration.lock` empeche deux inventaires ou migrations d'ecrire simultanement dans le meme projet.
 
 ## Base de donnees projet
 
@@ -346,7 +364,7 @@ Table centrale de la migration. Une ligne correspond a un fichier local inventor
 Statuts possibles:
 
 - `Pending`: fichier pret a etre migre.
-- `Uploading`: fichier en cours de traitement. Si le script s'arrete brutalement, ce statut est remis a `Pending` au prochain `-Migrate` ou `-Resume`.
+- `Uploading`: fichier dont la tentative a commence sans resultat final confirme. A la reprise, son existence distante est verifiee avant toute nouvelle tentative.
 - `Uploaded`: fichier envoye avec succes.
 - `Failed`: erreur lors de l'upload.
 - `BlockedExtension`: fichier bloque car son extension est interdite par le tenant.
@@ -389,6 +407,8 @@ Le script contient les options suivantes:
 - `-WhatIf`: simuler les uploads et suppressions pour une migration ou reprise, sans modifier SharePoint.
 - `-Help`: afficher l'aide integree.
 - `-Overwrite`: autoriser l'ecrasement des fichiers existants.
+- `-ParallelUploads`: surcharge le nombre d'uploads simultanes configure dans le XML.
+- `-AssumeDestinationEmpty`: ignore le controle `Get-PnPFile` avant upload. A utiliser uniquement si la destination ne contient pas de fichiers externes au projet.
 - `-Inventory`: generer uniquement un inventaire. Avec `-Project`, l'inventaire est stocke dans `migration.db`.
 - `-DeltaInventory`: mettre a jour l'inventaire uniquement pour les fichiers nouveaux ou modifies.
 - `-CheckChanges`: generer un rapport de changements sans modifier les statuts en base.
@@ -553,12 +573,18 @@ Les limites de migration sont configurees dans le `config.xml` du projet:
     <HashMode>SHA256</HashMode>
     <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
     <MaxTotalErrors>1000</MaxTotalErrors>
+    <ParallelUploads>4</ParallelUploads>
+    <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+    <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
 
 - `HashMode`: `SHA256`, `Quick` ou `None`.
 - `MaxAttemptsPerFile`: un fichier dont `AttemptCount` atteint cette valeur n'est plus repris par `-Migrate` ou `-Resume`.
 - `MaxTotalErrors`: si ce nombre d'erreurs est atteint pendant une execution, la migration s'arrete.
+- `ParallelUploads`: nombre d'uploads executes simultanement. Augmenter progressivement pour surveiller le throttling SharePoint.
+- `AssumeDestinationEmpty`: supprime un appel distant par fichier, mais peut ecraser un fichier SharePoint non reference dans SQLite.
+- `ProcessingBatchSize`: limite la quantite de lignes SQLite chargees et groupees en memoire. `1000` convient a la plupart des migrations.
 
 Dans un projet existant, modifier le fichier:
 

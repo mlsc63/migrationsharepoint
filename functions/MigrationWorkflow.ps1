@@ -40,6 +40,8 @@ function Show-MigrationHelp {
     Write-Host "  -ReportRetentionDays <n>    Jours de conservation des rapports. Defaut: 30."
     Write-Host "  -WhatIf                     Simule migration/reprise sans upload ni suppression SharePoint."
     Write-Host "  -Overwrite                  Supprime le fichier cible existant puis upload."
+    Write-Host "  -ParallelUploads <1-16>    Nombre d'uploads simultanes. 0 = valeur XML."
+    Write-Host "  -AssumeDestinationEmpty    Ignore le controle d'existence distant avant upload."
     Write-Host "  -ExcludeFile <patterns>     Exclut des fichiers, ex: *.tmp,Thumbs.db."
     Write-Host "  -ExcludeFolder <patterns>   Exclut des dossiers, ex: node_modules,archive/*."
     Write-Host ""
@@ -51,6 +53,9 @@ function Show-MigrationHelp {
     Write-Host "  Migration.HashMode          SHA256, Quick ou None."
     Write-Host "  Migration.MaxAttemptsPerFile Nombre max de tentatives par fichier. 0 = illimite."
     Write-Host "  Migration.MaxTotalErrors    Nombre max d'erreurs par execution. 0 = illimite."
+    Write-Host "  Migration.ParallelUploads   Nombre d'uploads simultanes. Defaut: 4."
+    Write-Host "  Migration.AssumeDestinationEmpty Ignore Get-PnPFile avant chaque upload."
+    Write-Host "  Migration.ProcessingBatchSize Nombre de lignes SQLite chargees par page."
     Write-Host "  Exclusions.*                Motifs de fichiers/dossiers a ignorer."
     Write-Host ""
     Write-Host "Statuts base"
@@ -58,6 +63,39 @@ function Show-MigrationHelp {
     Write-Host ""
     Write-Host "Documentation complete: README.md"
     Write-Host ""
+}
+
+function Test-PnPNotFoundError {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        $serverErrorCode = $exception.PSObject.Properties["ServerErrorCode"]
+        $serverErrorCodeText = if ($null -ne $serverErrorCode) { "$($serverErrorCode.Value)" } else { "" }
+        if ($serverErrorCodeText -in @("-2147024894", "404")) {
+            return $true
+        }
+
+        $response = $exception.PSObject.Properties["Response"]
+        if ($null -ne $response -and $null -ne $response.Value) {
+            $statusCode = $response.Value.PSObject.Properties["StatusCode"]
+            $statusCodeText = if ($null -ne $statusCode) { "$($statusCode.Value)" } else { "" }
+            if ($statusCodeText -match "^(404|NotFound)$") {
+                return $true
+            }
+        }
+
+        if ($exception.Message -match "(?i)(404|file not found|does not exist|introuvable|n'existe pas)") {
+            return $true
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    return $false
 }
 
 function Get-MigrationContext {
@@ -90,11 +128,17 @@ function Get-MigrationContext {
     $maxAttemptsPerFile = 3
     $maxTotalErrors = 1000
     $hashMode = "SHA256"
+    $parallelUploads = 4
+    $assumeDestinationEmpty = $false
+    $processingBatchSize = 1000
 
     if ($null -ne $migrationNode) {
         $maxAttemptsNode = $migrationNode.SelectSingleNode("MaxAttemptsPerFile")
         $maxTotalErrorsNode = $migrationNode.SelectSingleNode("MaxTotalErrors")
         $hashModeNode = $migrationNode.SelectSingleNode("HashMode")
+        $parallelUploadsNode = $migrationNode.SelectSingleNode("ParallelUploads")
+        $assumeDestinationEmptyNode = $migrationNode.SelectSingleNode("AssumeDestinationEmpty")
+        $processingBatchSizeNode = $migrationNode.SelectSingleNode("ProcessingBatchSize")
 
         if ($null -ne $maxAttemptsNode -and -not [string]::IsNullOrWhiteSpace($maxAttemptsNode.InnerText)) {
             $maxAttemptsPerFile = [int]$maxAttemptsNode.InnerText
@@ -107,6 +151,26 @@ function Get-MigrationContext {
         if ($null -ne $hashModeNode -and -not [string]::IsNullOrWhiteSpace($hashModeNode.InnerText)) {
             $hashMode = "$($hashModeNode.InnerText)".Trim()
         }
+
+        if ($null -ne $parallelUploadsNode -and -not [string]::IsNullOrWhiteSpace($parallelUploadsNode.InnerText)) {
+            $parallelUploads = [int]$parallelUploadsNode.InnerText
+        }
+
+        if ($null -ne $assumeDestinationEmptyNode -and -not [string]::IsNullOrWhiteSpace($assumeDestinationEmptyNode.InnerText)) {
+            $assumeDestinationEmpty = [System.Convert]::ToBoolean($assumeDestinationEmptyNode.InnerText)
+        }
+
+        if ($null -ne $processingBatchSizeNode -and -not [string]::IsNullOrWhiteSpace($processingBatchSizeNode.InnerText)) {
+            $processingBatchSize = [int]$processingBatchSizeNode.InnerText
+        }
+    }
+
+    if ($parallelUploads -lt 1 -or $parallelUploads -gt 16) {
+        throw "Migration.ParallelUploads doit etre compris entre 1 et 16."
+    }
+
+    if ($processingBatchSize -lt 100 -or $processingBatchSize -gt 100000) {
+        throw "Migration.ProcessingBatchSize doit etre compris entre 100 et 100000."
     }
 
     $exclusionsNode = $config.SelectSingleNode("/Configuration/Exclusions")
@@ -153,6 +217,9 @@ function Get-MigrationContext {
         MaxAttemptsPerFile    = $maxAttemptsPerFile
         MaxTotalErrors        = $maxTotalErrors
         HashMode              = $hashMode
+        ParallelUploads       = $parallelUploads
+        AssumeDestinationEmpty = $assumeDestinationEmpty
+        ProcessingBatchSize   = $processingBatchSize
     }
 }
 
@@ -612,6 +679,228 @@ function Invoke-ProjectCheckChanges {
     }
 }
 
+function Invoke-ParallelMigrationUploads {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [ValidateRange(1, 16)]
+        [int]$ThrottleLimit = 4,
+
+        [ValidateRange(1, 1000)]
+        [int]$TaskSize = 25,
+
+        [switch]$Overwrite,
+
+        [switch]$AssumeDestinationEmpty
+    )
+
+    if ($Rows.Count -eq 0) {
+        return
+    }
+
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "Les uploads paralleles necessitent PowerShell 7 ou plus recent."
+    }
+
+    $siteUrl = $Context.Destination.SiteUrl
+    $tenantId = $Context.TenantId
+    $clientId = $Context.ClientId
+    $certificateThumbprint = $Context.CertificateThumbprint
+    $databasePathValue = $DatabasePath
+    $overwriteEnabled = [bool]$Overwrite
+    $skipExistenceCheck = [bool]$AssumeDestinationEmpty
+
+    $folderTasks = @($Rows | Group-Object -Property TargetFolder | ForEach-Object {
+        $folderRows = @($_.Group)
+
+        for ($offset = 0; $offset -lt $folderRows.Count; $offset += $TaskSize) {
+            $lastIndex = [Math]::Min($offset + $TaskSize - 1, $folderRows.Count - 1)
+            [pscustomobject]@{
+                TargetFolder = $_.Name
+                Rows         = @($folderRows[$offset..$lastIndex])
+            }
+        }
+    })
+
+    $folderTasks | ForEach-Object -Parallel {
+        $task = $_
+        $operation = "Connexion SharePoint"
+
+        function Test-PnPNotFoundError {
+            param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+            $exception = $ErrorRecord.Exception
+            while ($null -ne $exception) {
+                $serverErrorCode = $exception.PSObject.Properties["ServerErrorCode"]
+                $serverErrorCodeText = if ($null -ne $serverErrorCode) { "$($serverErrorCode.Value)" } else { "" }
+                if ($serverErrorCodeText -in @("-2147024894", "404")) {
+                    return $true
+                }
+
+                $response = $exception.PSObject.Properties["Response"]
+                if ($null -ne $response -and $null -ne $response.Value) {
+                    $statusCode = $response.Value.PSObject.Properties["StatusCode"]
+                    $statusCodeText = if ($null -ne $statusCode) { "$($statusCode.Value)" } else { "" }
+                    if ($statusCodeText -match "^(404|NotFound)$") {
+                        return $true
+                    }
+                }
+
+                if ($exception.Message -match "(?i)(404|file not found|does not exist|introuvable|n'existe pas)") {
+                    return $true
+                }
+
+                $exception = $exception.InnerException
+            }
+
+            return $false
+        }
+
+        try {
+            $connectionVariable = Get-Variable -Name MigrationPnPConnection -Scope Script -ErrorAction SilentlyContinue
+            if ($null -eq $connectionVariable -or $null -eq $connectionVariable.Value) {
+                Import-Module PnP.PowerShell -ErrorAction Stop
+                Import-Module PSSQLite -ErrorAction Stop
+                $script:MigrationPnPConnection = Connect-PnPOnline `
+                    -Url $using:siteUrl `
+                    -Tenant $using:tenantId `
+                    -ClientId $using:clientId `
+                    -Thumbprint $using:certificateThumbprint `
+                    -ReturnConnection `
+                    -ErrorAction Stop
+            }
+
+            $connection = $script:MigrationPnPConnection
+            $operation = "Creation/verification du dossier SharePoint"
+            $parts = @($task.TargetFolder.Trim("/") -split "/" | Where-Object { $_ })
+
+            if ($parts.Count -lt 3) {
+                throw "Chemin SharePoint invalide: $($task.TargetFolder)"
+            }
+
+            $currentFolder = "/$($parts[0])/$($parts[1])/$($parts[2])"
+            Get-PnPFolder -Url $currentFolder -Connection $connection -ErrorAction Stop | Out-Null
+
+            for ($i = 3; $i -lt $parts.Count; $i++) {
+                $parentFolder = $currentFolder
+                $currentFolder = "$currentFolder/$($parts[$i])"
+
+                try {
+                    Get-PnPFolder -Url $currentFolder -Connection $connection -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
+                        throw
+                    }
+
+                    try {
+                        Add-PnPFolder -Name $parts[$i] -Folder $parentFolder -Connection $connection -ErrorAction Stop | Out-Null
+                    }
+                    catch {
+                        Get-PnPFolder -Url $currentFolder -Connection $connection -ErrorAction Stop | Out-Null
+                    }
+                }
+            }
+        }
+        catch {
+            foreach ($row in $task.Rows) {
+                [pscustomobject]@{
+                    Id           = [int]$row.Id
+                    RelativePath = "$($row.RelativePath)"
+                    TargetUrl    = "$($row.TargetUrl)"
+                    SizeBytes    = [long]$row.SizeBytes
+                    Status       = "Failed"
+                    Message      = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
+                    AttemptStarted = $false
+                }
+            }
+            return
+        }
+
+        foreach ($row in $task.Rows) {
+            $operation = "Initialisation de la tentative SQLite"
+            $attemptStarted = $false
+
+            try {
+                $now = (Get-Date).ToUniversalTime().ToString("o")
+                Invoke-SqliteQuery `
+                    -DataSource $using:databasePathValue `
+                    -Query "PRAGMA busy_timeout=30000; UPDATE Files SET Status = 'Uploading', LastError = '', UpdatedAt = @UpdatedAt, AttemptCount = AttemptCount + 1 WHERE Id = @Id;" `
+                    -SqlParameters @{ UpdatedAt = $now; Id = [int]$row.Id } | Out-Null
+                $attemptStarted = $true
+                $fileExists = $false
+                $mustCheckExistence = (-not $using:skipExistenceCheck) -or "$($row.Status)" -eq "Uploading"
+
+                if ($mustCheckExistence) {
+                    $operation = "Verification de l'existence du fichier SharePoint"
+                    try {
+                        Get-PnPFile -Url $row.TargetUrl -Connection $connection -ErrorAction Stop | Out-Null
+                        $fileExists = $true
+                    }
+                    catch {
+                        if (Test-PnPNotFoundError -ErrorRecord $_) {
+                            $fileExists = $false
+                        }
+                        else {
+                            throw
+                        }
+                    }
+                }
+
+                if ($fileExists -and -not $using:overwriteEnabled) {
+                    [pscustomobject]@{
+                        Id             = [int]$row.Id
+                        RelativePath   = "$($row.RelativePath)"
+                        TargetUrl      = "$($row.TargetUrl)"
+                        SizeBytes      = [long]$row.SizeBytes
+                        Status         = "SkippedExists"
+                        Message        = "Existe deja dans SharePoint"
+                        AttemptStarted = $attemptStarted
+                    }
+                    continue
+                }
+
+                if ($fileExists -and $using:overwriteEnabled) {
+                    $operation = "Suppression du fichier cible avant ecrasement"
+                    Remove-PnPFile -ServerRelativeUrl $row.TargetUrl -Force -Connection $connection -ErrorAction Stop
+                }
+
+                $operation = "Upload du fichier vers SharePoint"
+                Add-PnPFile -Path $row.FullPath -Folder $row.TargetFolder -Connection $connection -ErrorAction Stop | Out-Null
+
+                [pscustomobject]@{
+                    Id             = [int]$row.Id
+                    RelativePath   = "$($row.RelativePath)"
+                    TargetUrl      = "$($row.TargetUrl)"
+                    SizeBytes      = [long]$row.SizeBytes
+                    Status         = "Uploaded"
+                    Message        = ""
+                    AttemptStarted = $attemptStarted
+                }
+            }
+            catch {
+                [pscustomobject]@{
+                    Id             = [int]$row.Id
+                    RelativePath   = "$($row.RelativePath)"
+                    TargetUrl      = "$($row.TargetUrl)"
+                    SizeBytes      = [long]$row.SizeBytes
+                    Status         = "Failed"
+                    Message        = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
+                    AttemptStarted = $attemptStarted
+                }
+            }
+        }
+    } -ThrottleLimit $ThrottleLimit
+}
+
 function Invoke-ProjectMigration {
     param(
         [Parameter(Mandatory)]
@@ -626,14 +915,19 @@ function Invoke-ProjectMigration {
 
         [switch]$Overwrite,
 
-        [switch]$DeleteRemoteMissing
+        [switch]$DeleteRemoteMissing,
+
+        [ValidateRange(1, 16)]
+        [int]$ParallelUploads = 4,
+
+        [switch]$AssumeDestinationEmpty
     )
 
     Reset-IncompleteUploads -DatabasePath $ProjectInfo.DatabasePath
-    $filesToProcess = @(Get-MigrationFilesToProcess `
+    $totalFilesToProcess = Get-MigrationFilesToProcessCount `
         -DatabasePath $ProjectInfo.DatabasePath `
         -IncludeFailed:$IncludeFailed `
-        -MaxAttemptsPerFile $Context.MaxAttemptsPerFile)
+        -MaxAttemptsPerFile $Context.MaxAttemptsPerFile
     $remoteDeleteCandidates = @()
     if ($DeleteRemoteMissing) {
         $remoteDeleteCandidates = @(Get-MigrationRemoteDeleteCandidates `
@@ -650,104 +944,107 @@ function Invoke-ProjectMigration {
     $maxTotalErrors = [int]$Context.MaxTotalErrors
 
     try {
-        Write-Step "$($filesToProcess.Count) fichier(s) a traiter depuis la base projet"
+        Write-Step "$totalFilesToProcess fichier(s) a traiter depuis la base projet"
         if ($DeleteRemoteMissing) {
             Write-Step "$($remoteDeleteCandidates.Count) fichier(s) distant(s) a supprimer car absents localement"
         }
         Write-Log -Level "INFO" -Message "Tentatives max par fichier: $($Context.MaxAttemptsPerFile)"
         Write-Log -Level "INFO" -Message "Erreurs max avant arret: $maxTotalErrors"
         Write-Log -Level "INFO" -Message "Suppression distante MissingLocalFile: $DeleteRemoteMissing"
+        Write-Log -Level "INFO" -Message "Uploads paralleles: $ParallelUploads"
+        Write-Log -Level "INFO" -Message "Taille des pages SQLite: $($Context.ProcessingBatchSize)"
+        Write-Log -Level "INFO" -Message "Controle d'existence distant ignore: $AssumeDestinationEmpty"
+        if ($AssumeDestinationEmpty) {
+            Write-Log -Level "WARN" -Message "Le mode AssumeDestinationEmpty peut ecraser un fichier distant non reference dans la base projet."
+        }
 
-        foreach ($row in $filesToProcess) {
+        $afterFileId = 0
+        $processedFileCount = 0
+
+        while ($true) {
+            $filesToProcess = @(Get-MigrationFilesToProcess `
+                -DatabasePath $ProjectInfo.DatabasePath `
+                -IncludeFailed:$IncludeFailed `
+                -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
+                -AfterId $afterFileId `
+                -BatchSize $Context.ProcessingBatchSize)
+
+            if ($filesToProcess.Count -eq 0) {
+                break
+            }
+
+            $afterFileId = [int](($filesToProcess | Measure-Object -Property Id -Maximum).Maximum)
+            $uploadRows = [System.Collections.Generic.List[object]]::new()
+
+            foreach ($row in $filesToProcess) {
             $fileSize = Format-FileSize -Bytes ([long]$row.SizeBytes)
-            $currentOperation = "Preparation"
 
-            try {
-                if (-not (Test-Path -LiteralPath $row.FullPath)) {
-                    Write-Log -Level "WARN" -Message "[MANQUANT] $($row.RelativePath) - $($row.FullPath)"
+            if (-not (Test-Path -LiteralPath $row.FullPath)) {
+                Write-Log -Level "WARN" -Message "[MANQUANT] $($row.RelativePath) - $($row.FullPath)"
 
-                    if ($DeleteRemoteMissing) {
-                        if ($WhatIf) {
-                            Write-Log -Level "INFO" -Message "[WHATIF] Suppression distante du fichier local manquant: $($row.TargetUrl)"
-                            continue
-                        }
-
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Suppression distante en cours" -IncrementAttempt
-
-                        $fileExists = $false
-                        try {
-                            Get-PnPFile -Url $row.TargetUrl -ErrorAction Stop | Out-Null
-                            $fileExists = $true
-                        }
-                        catch {
-                            $fileExists = $false
-                        }
-
-                        if ($fileExists) {
-                            Remove-PnPFile -ServerRelativeUrl $row.TargetUrl -Force -ErrorAction Stop
-                            Write-Log -Level "SUCCESS" -Message "[DELETE] Supprime de SharePoint: $($row.TargetUrl)"
-                        }
-                        else {
-                            Write-Log -Level "WARN" -Message "[DELETE] Deja absent de SharePoint: $($row.TargetUrl)"
-                        }
-
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "DeletedRemote" -LastError ""
-                        $deletedRemote++
+                if ($DeleteRemoteMissing) {
+                    if ($WhatIf) {
+                        Write-Log -Level "INFO" -Message "[WHATIF] Suppression distante du fichier local manquant: $($row.TargetUrl)"
                     }
                     else {
                         Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
+                        $remoteDeleteCandidates += $row
+                    }
+                }
+                else {
+                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
+                    $failed++
+                    if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
+                        throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
+                    }
+                }
+                continue
+            }
+
+            if ($WhatIf) {
+                Write-Log -Level "INFO" -Message "[WHATIF] $($row.FullPath) -> $($row.TargetUrl) - Taille: $fileSize"
+                continue
+            }
+
+            $uploadRows.Add($row)
+            }
+
+            Invoke-ParallelMigrationUploads `
+                -Rows $uploadRows.ToArray() `
+                -Context $Context `
+                -DatabasePath $ProjectInfo.DatabasePath `
+                -ThrottleLimit $ParallelUploads `
+                -Overwrite:$Overwrite `
+                -AssumeDestinationEmpty:$AssumeDestinationEmpty |
+                ForEach-Object {
+                $result = $_
+                $fileSize = Format-FileSize -Bytes ([long]$result.SizeBytes)
+                $incrementAttempt = -not [bool]$result.AttemptStarted
+
+                switch ($result.Status) {
+                    "Uploaded" {
+                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Uploaded" -LastError "" -IncrementAttempt:$incrementAttempt -SetUploadedAt
+                        Write-Log -Level "SUCCESS" -Message "[OK] $($result.RelativePath) - Cible: $($result.TargetUrl) - Taille: $fileSize"
+                        $uploaded++
+                    }
+                    "SkippedExists" {
+                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "SkippedExists" -LastError $result.Message -IncrementAttempt:$incrementAttempt
+                        Write-Log -Level "WARN" -Message "[SKIP] Existe deja: $($result.TargetUrl) - Taille: $fileSize"
+                        $skipped++
+                    }
+                    default {
+                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Failed" -LastError $result.Message -IncrementAttempt:$incrementAttempt
+                        Write-Log -Level "ERROR" -Message "[ERREUR] $($result.RelativePath) - Taille: $fileSize - $($result.Message)"
                         $failed++
                         if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
                             throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
                         }
                     }
-                    continue
+                }
                 }
 
-                if ($WhatIf) {
-                    Write-Log -Level "INFO" -Message "[WHATIF] $($row.FullPath) -> $($row.TargetUrl) - Taille: $fileSize"
-                    continue
-                }
-
-                Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "Uploading" -LastError "" -IncrementAttempt
-
-                $currentOperation = "Creation/verification du dossier SharePoint"
-                Ensure-RemoteFolder -ServerRelativeFolder $row.TargetFolder
-
-                $fileExists = $false
-                try {
-                    $currentOperation = "Verification de l'existence du fichier SharePoint"
-                    Get-PnPFile -Url $row.TargetUrl -ErrorAction Stop | Out-Null
-                    $fileExists = $true
-                }
-                catch {
-                    $fileExists = $false
-                }
-
-                if ($fileExists -and -not $Overwrite) {
-                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "SkippedExists" -LastError "Existe deja dans SharePoint"
-                    Write-Log -Level "WARN" -Message "[SKIP] Existe deja: $($row.TargetUrl) - Taille: $fileSize"
-                    $skipped++
-                    continue
-                }
-
-                $currentOperation = "Upload du fichier vers SharePoint"
-                Write-Log -Level "INFO" -Message "Upload cible: $($row.TargetUrl) - Taille: $fileSize"
-                Add-MigrationPnPFile -LocalPath $row.FullPath -TargetFolder $row.TargetFolder -TargetUrl $row.TargetUrl -Overwrite:$Overwrite -TargetExists:$fileExists
-
-                Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "Uploaded" -LastError "" -SetUploadedAt
-                Write-Log -Level "SUCCESS" -Message "[OK] $($row.RelativePath) - Taille: $fileSize"
-                $uploaded++
-            }
-            catch {
-                $message = "Operation: $currentOperation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
-                Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "Failed" -LastError $message
-                Write-Log -Level "ERROR" -Message "[ERREUR] $($row.RelativePath) - Taille: $fileSize - $message"
-                $failed++
-                if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
-                    throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
-                }
-            }
+            $processedFileCount += $filesToProcess.Count
+            Write-Log -Level "INFO" -Message "Progression du run: $processedFileCount/$totalFilesToProcess"
         }
 
         foreach ($row in $remoteDeleteCandidates) {
@@ -767,7 +1064,12 @@ function Invoke-ProjectMigration {
                     $fileExists = $true
                 }
                 catch {
-                    $fileExists = $false
+                    if (Test-PnPNotFoundError -ErrorRecord $_) {
+                        $fileExists = $false
+                    }
+                    else {
+                        throw
+                    }
                 }
 
                 if ($fileExists) {
@@ -888,7 +1190,12 @@ function Invoke-LegacyMigration {
                 $fileExists = $true
             }
             catch {
-                $fileExists = $false
+                if (Test-PnPNotFoundError -ErrorRecord $_) {
+                    $fileExists = $false
+                }
+                else {
+                    throw
+                }
             }
 
             if ($fileExists -and -not $Overwrite) {

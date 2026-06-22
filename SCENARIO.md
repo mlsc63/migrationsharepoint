@@ -33,6 +33,9 @@ Exemple de configuration fonctionnelle:
     <HashMode>SHA256</HashMode>
     <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
     <MaxTotalErrors>1000</MaxTotalErrors>
+    <ParallelUploads>4</ParallelUploads>
+    <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+    <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
 
@@ -41,6 +44,9 @@ Dans ce scenario:
 - `SHA256` permet de detecter les modifications reelles du contenu;
 - `MaxAttemptsPerFile` evite de retenter indefiniment le meme fichier;
 - `MaxTotalErrors` arrete la migration si trop d'erreurs apparaissent pendant une execution.
+- `ParallelUploads` execute plusieurs uploads simultanement;
+- `AssumeDestinationEmpty` controle si l'existence distante est verifiee avant chaque upload;
+- `ProcessingBatchSize` limite la memoire utilisee pour lire la base SQLite.
 
 ## Etape 1 - Afficher l'aide
 
@@ -271,7 +277,7 @@ Ce que fait le script:
 
 - reprend les fichiers `Pending`;
 - reprend aussi les fichiers `Failed`, si leur nombre de tentatives le permet;
-- remet les fichiers restes en `Uploading` dans un etat traitable;
+- conserve les fichiers restes en `Uploading` et force leur verification distante;
 - conserve les fichiers deja `Uploaded` ou `SkippedExists`.
 
 Resultat attendu:

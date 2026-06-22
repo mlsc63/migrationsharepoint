@@ -19,7 +19,10 @@ param(
     [int]$ReportRetentionDays = 30,
     [switch]$ResetFailed,
     [string[]]$ExcludeFile,
-    [string[]]$ExcludeFolder
+    [string[]]$ExcludeFolder,
+    [ValidateRange(0, 16)]
+    [int]$ParallelUploads = 0,
+    [switch]$AssumeDestinationEmpty
 )
 
 Set-StrictMode -Version Latest
@@ -66,6 +69,21 @@ if (-not $projectInfo -and $projectOnlyActionRequested) {
     )"
 }
 
+$projectLock = $null
+$requiresProjectLock = $projectInfo -and (
+    $Inventory -or
+    $DeltaInventory -or
+    $CheckChanges -or
+    $Migrate -or
+    $Resume -or
+    $ResetFailed)
+
+if ($requiresProjectLock) {
+    $projectLock = Enter-MigrationProjectLock -DatabasePath $projectInfo.DatabasePath
+}
+
+try {
+
 if ($projectInfo -and $Status) {
     Write-ProjectStatus -ProjectInfo $projectInfo
     return
@@ -111,6 +129,10 @@ Write-Log -Level "INFO" -Message "Mode inventaire: $Inventory"
 Write-Log -Level "INFO" -Message "Mode delta inventaire: $DeltaInventory"
 Write-Log -Level "INFO" -Message "Mode controle changements: $CheckChanges"
 Write-Log -Level "INFO" -Message "Inclure les fichiers supprimes: $IncludeDeleted"
+$effectiveParallelUploads = if ($ParallelUploads -gt 0) { $ParallelUploads } else { $context.ParallelUploads }
+$effectiveAssumeDestinationEmpty = $AssumeDestinationEmpty -or $context.AssumeDestinationEmpty
+Write-Log -Level "INFO" -Message "Uploads paralleles: $effectiveParallelUploads"
+Write-Log -Level "INFO" -Message "Destination supposee vide: $effectiveAssumeDestinationEmpty"
 if ($projectInfo) {
     Write-Log -Level "INFO" -Message "Projet: $($projectInfo.Name)"
     Write-Log -Level "INFO" -Message "Base projet: $($projectInfo.DatabasePath)"
@@ -144,7 +166,15 @@ if ($projectInfo) {
     }
 
     if ($Migrate -or $Resume) {
-        Invoke-ProjectMigration -ProjectInfo $projectInfo -Context $context -IncludeFailed:$Resume -WhatIf:$WhatIf -Overwrite:$Overwrite -DeleteRemoteMissing:$DeleteRemoteMissing
+        Invoke-ProjectMigration `
+            -ProjectInfo $projectInfo `
+            -Context $context `
+            -IncludeFailed:$Resume `
+            -WhatIf:$WhatIf `
+            -Overwrite:$Overwrite `
+            -DeleteRemoteMissing:$DeleteRemoteMissing `
+            -ParallelUploads $effectiveParallelUploads `
+            -AssumeDestinationEmpty:$effectiveAssumeDestinationEmpty
         Write-Log -Level "INFO" -Message "Journal: $resolvedLogPath"
         return
     }
@@ -155,3 +185,7 @@ if ($projectInfo) {
 
 Invoke-LegacyMigration -Context $context -WhatIf:$WhatIf -Overwrite:$Overwrite -Inventory:$Inventory -BlockedExtensions $blockedExtensions
 Write-Log -Level "INFO" -Message "Journal: $resolvedLogPath"
+}
+finally {
+    Exit-MigrationProjectLock -LockStream $projectLock
+}

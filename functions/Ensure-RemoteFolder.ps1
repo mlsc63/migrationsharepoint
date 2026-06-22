@@ -3,11 +3,12 @@ function Ensure-RemoteFolder {
         [Parameter(Mandatory)]
         [string]$ServerRelativeFolder,
 
+        [string]$ExistingRoot,
+
         [switch]$WhatIf
     )
 
-    $normalized = $ServerRelativeFolder.Trim("/")
-    $parts = @($normalized -split "/" | Where-Object { $_ })
+    $normalized = "/$($ServerRelativeFolder.Trim('/'))"
 
     $cacheVariable = Get-Variable -Name VerifiedRemoteFolders -Scope Script -ErrorAction SilentlyContinue
     if ($null -eq $cacheVariable) {
@@ -15,11 +16,24 @@ function Ensure-RemoteFolder {
             [System.StringComparer]::OrdinalIgnoreCase)
     }
 
-    if ($parts.Count -lt 3) {
-        throw "Chemin SharePoint invalide: $ServerRelativeFolder"
-    }
+    if ([string]::IsNullOrWhiteSpace($ExistingRoot)) {
+        $parts = @($normalized.Trim("/") -split "/" | Where-Object { $_ })
+        if ($parts.Count -lt 3) {
+            throw "Chemin SharePoint invalide: $ServerRelativeFolder"
+        }
 
-    $current = "/$($parts[0])/$($parts[1])/$($parts[2])"
+        $current = "/$($parts[0])/$($parts[1])/$($parts[2])"
+        $remainingParts = @($parts | Select-Object -Skip 3)
+    }
+    else {
+        $current = "/$($ExistingRoot.Trim('/'))"
+        if ($normalized -ne $current -and -not $normalized.StartsWith("$current/", [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Le dossier cible n'est pas situe sous la racine SharePoint attendue: $ServerRelativeFolder"
+        }
+
+        $relativeFolder = $normalized.Substring($current.Length).Trim("/")
+        $remainingParts = @($relativeFolder -split "/" | Where-Object { $_ })
+    }
 
     if (-not $script:VerifiedRemoteFolders.Contains($current)) {
         try {
@@ -31,9 +45,9 @@ function Ensure-RemoteFolder {
         }
     }
 
-    for ($i = 3; $i -lt $parts.Count; $i++) {
+    foreach ($part in $remainingParts) {
         $parent = $current
-        $current = "$current/$($parts[$i])"
+        $current = "$current/$part"
 
         if ($script:VerifiedRemoteFolders.Contains($current)) {
             continue
@@ -43,9 +57,13 @@ function Ensure-RemoteFolder {
             Get-PnPFolder -Url $current -ErrorAction Stop | Out-Null
         }
         catch {
+            if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
+                throw
+            }
+
             Write-Log -Level "INFO" -Message "Creation du dossier SharePoint: $current"
             if (-not $WhatIf) {
-                Add-PnPFolder -Name $parts[$i] -Folder $parent | Out-Null
+                Add-PnPFolder -Name $part -Folder $parent -ErrorAction Stop | Out-Null
             }
         }
 

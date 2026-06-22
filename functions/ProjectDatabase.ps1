@@ -6,6 +6,42 @@ function Ensure-PSSQLite {
     Import-Module PSSQLite -ErrorAction Stop
 }
 
+function Invoke-MigrationDatabaseTransaction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$Action
+    )
+
+    $connection = New-SQLiteConnection -DataSource $DatabasePath -Open $true
+
+    try {
+        Invoke-SqliteQuery -SQLiteConnection $connection -Query "PRAGMA busy_timeout=30000; BEGIN IMMEDIATE;" | Out-Null
+
+        try {
+            & $Action $connection
+            Invoke-SqliteQuery -SQLiteConnection $connection -Query "COMMIT;" | Out-Null
+        }
+        catch {
+            try {
+                Invoke-SqliteQuery -SQLiteConnection $connection -Query "ROLLBACK;" | Out-Null
+            }
+            catch {
+                # Preserve the original transaction error.
+            }
+
+            throw
+        }
+    }
+    finally {
+        if ($null -ne $connection) {
+            $connection.Dispose()
+        }
+    }
+}
+
 function Enter-MigrationProjectLock {
     param(
         [Parameter(Mandatory)]
@@ -25,6 +61,7 @@ function Enter-MigrationProjectLock {
         throw "Le projet est deja utilise par cette execution: $projectDirectory"
     }
 
+    $lockStream = $null
     try {
         $lockStream = [System.IO.File]::Open(
             $lockPath,
@@ -43,6 +80,10 @@ function Enter-MigrationProjectLock {
         return ,$lockStream
     }
     catch [System.IO.IOException] {
+        if ($null -ne $lockStream) {
+            $lockStream.Dispose()
+        }
+
         throw "Le projet est deja utilise par une autre execution: $projectDirectory"
     }
 }
@@ -106,6 +147,7 @@ CREATE TABLE IF NOT EXISTS Files (
     TargetFolder TEXT NOT NULL,
     TargetUrl TEXT NOT NULL,
     Status TEXT NOT NULL,
+    StatusBeforeExclusion TEXT,
     AttemptCount INTEGER NOT NULL DEFAULT 0,
     LastError TEXT,
     LastInventorySeenAt TEXT,
@@ -128,11 +170,13 @@ CREATE TABLE IF NOT EXISTS Runs (
 "@
 
     Invoke-SqliteQuery -DataSource $DatabasePath -Query $schema | Out-Null
+    Invoke-SqliteQuery -DataSource $DatabasePath -Query "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;" | Out-Null
     Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "FileHash" -ColumnDefinition "TEXT"
     Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "PreviousFileHash" -ColumnDefinition "TEXT"
     Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "HashChanged" -ColumnDefinition "INTEGER NOT NULL DEFAULT 0"
     Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "LastHashChangedAt" -ColumnDefinition "TEXT"
     Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "LastInventorySeenAt" -ColumnDefinition "TEXT"
+    Add-SqliteColumnIfMissing -DatabasePath $DatabasePath -TableName "Files" -ColumnName "StatusBeforeExclusion" -ColumnDefinition "TEXT"
 }
 
 function Add-SqliteColumnIfMissing {
@@ -269,9 +313,16 @@ function Get-MigrationProject {
     $projectInfo = Get-Content -Raw -LiteralPath $projectJsonPath | ConvertFrom-Json
     $projectInfo.DatabasePath = (Resolve-Path -LiteralPath $databasePath).Path
     $projectInfo.Directory = $projectDirectory
-    $projectInfo.ConfigPath = (Resolve-Path -LiteralPath $projectInfo.ConfigPath).Path
+    $projectInfo.ConfigPath = (Resolve-Path -LiteralPath (Join-Path $projectDirectory "config.xml")).Path
+    $projectInfo.LogDirectory = Join-Path $projectDirectory "logs"
+    $projectInfo.ReportDirectory = Join-Path $projectDirectory "reports"
 
-    Initialize-MigrationDatabase -DatabasePath $projectInfo.DatabasePath
+    foreach ($directory in @($projectInfo.LogDirectory, $projectInfo.ReportDirectory)) {
+        if (-not (Test-Path -LiteralPath $directory)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        }
+    }
+
     return $projectInfo
 }
 
@@ -340,14 +391,24 @@ function Reset-IncompleteUploads {
 function Reset-MigrationHashChanges {
     param(
         [Parameter(Mandatory)]
-        [string]$DatabasePath
+        [string]$DatabasePath,
+
+        [object]$SQLiteConnection
     )
 
     $now = (Get-Date).ToUniversalTime().ToString("o")
-    Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "UPDATE Files SET HashChanged = 0, LastHashChangedAt = NULL, UpdatedAt = @UpdatedAt;" `
-        -SqlParameters @{ UpdatedAt = $now } | Out-Null
+    $queryParameters = @{
+        Query         = "UPDATE Files SET HashChanged = 0, LastHashChangedAt = NULL, UpdatedAt = @UpdatedAt WHERE HashChanged <> 0 OR LastHashChangedAt IS NOT NULL;"
+        SqlParameters = @{ UpdatedAt = $now }
+    }
+    if ($null -ne $SQLiteConnection) {
+        $queryParameters.SQLiteConnection = $SQLiteConnection
+    }
+    else {
+        $queryParameters.DataSource = $DatabasePath
+    }
+
+    Invoke-SqliteQuery @queryParameters | Out-Null
 }
 
 function Get-MigrationFileFingerprint {
@@ -393,7 +454,14 @@ function Upsert-MigrationFile {
         [Parameter(Mandatory)]
         [string]$InventorySeenAt,
 
-        [string]$HashMode = "SHA256"
+        [string]$HashMode = "SHA256",
+
+        [AllowEmptyString()]
+        [string]$FileHash = "",
+
+        [switch]$FingerprintProvided,
+
+        [object]$SQLiteConnection
     )
 
     $relativePath = Convert-ToSharePointRelativePath -BasePath $SourceRoot -FilePath $File.FullName
@@ -407,75 +475,116 @@ function Upsert-MigrationFile {
     }
 
     $extension = [System.IO.Path]::GetExtension($File.Name).Trim().TrimStart(".").ToLowerInvariant()
+    if (-not $FingerprintProvided) {
+        $FileHash = Get-MigrationFileFingerprint -File $File -HashMode $HashMode
+    }
+
     $status = "Pending"
     $lastError = ""
-    $fileHash = Get-MigrationFileFingerprint -File $File -HashMode $HashMode
+    $attemptCount = 0
+    $uploadedAt = $null
+    $statusBeforeExclusion = $null
     $previousFileHash = ""
     $hashChanged = 0
     $lastHashChangedAt = $null
     $hashComparisonEnabled = $HashMode.ToUpperInvariant() -ne "NONE"
+    $isBlocked = -not [string]::IsNullOrWhiteSpace($extension) -and $BlockedExtensions -contains $extension
+    $isNew = $true
+    $contentChanged = $false
+    $statusChanged = $false
 
-    if (-not [string]::IsNullOrWhiteSpace($extension) -and $BlockedExtensions -contains $extension) {
+    if ($isBlocked) {
         $status = "BlockedExtension"
-        $lastError = "Extension bloquee par le tenant: .$extension"
+        $lastError = "Extension exclue par la politique de migration: .$extension"
     }
 
-    $existingRows = @(Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "SELECT Status, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, LastError FROM Files WHERE FullPath = @FullPath LIMIT 1;" `
-        -SqlParameters @{ FullPath = $File.FullName } `
-        -As "PSObject")
+    $selectParameters = @{
+        Query         = "SELECT Status, StatusBeforeExclusion, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, LastError, AttemptCount, UploadedAt FROM Files WHERE FullPath = @FullPath LIMIT 1;"
+        SqlParameters = @{ FullPath = $File.FullName }
+        As            = "PSObject"
+    }
+    if ($null -ne $SQLiteConnection) {
+        $selectParameters.SQLiteConnection = $SQLiteConnection
+    }
+    else {
+        $selectParameters.DataSource = $DatabasePath
+    }
+
+    $existingRows = @(Invoke-SqliteQuery @selectParameters)
 
     if ($existingRows.Count -gt 0) {
+        $isNew = $false
         $existingFile = $existingRows[0]
         $existingStatus = "$($existingFile.Status)"
+        $restoredStatus = if ($existingStatus -eq "Excluded") {
+            if (-not [string]::IsNullOrWhiteSpace("$($existingFile.StatusBeforeExclusion)")) {
+                "$($existingFile.StatusBeforeExclusion)"
+            }
+            else {
+                "Pending"
+            }
+        }
+        else {
+            $existingStatus
+        }
         $existingHash = "$($existingFile.FileHash)"
+        if (-not $hashComparisonEnabled) {
+            $FileHash = $existingHash
+        }
         $previousFileHash = $existingHash
+        $attemptCount = [int]$existingFile.AttemptCount
+        $uploadedAt = $existingFile.UploadedAt
+        $contentChanged = $hashComparisonEnabled -and -not [string]::IsNullOrWhiteSpace($existingHash) -and $existingHash -ne $FileHash
 
-        if ($status -ne "BlockedExtension" -and -not $hashComparisonEnabled) {
-            $status = $existingStatus
-            $lastError = "$($existingFile.LastError)"
-            $hashChanged = [int]$existingFile.HashChanged
-            $lastHashChangedAt = $existingFile.LastHashChangedAt
+        if ($isBlocked) {
+            $status = "BlockedExtension"
+            $lastError = "Extension exclue par la politique de migration: .$extension"
+            $attemptCount = 0
         }
-        elseif ($status -ne "BlockedExtension" -and $existingStatus -in @("Uploaded", "SkippedExists") -and [string]::IsNullOrWhiteSpace($existingHash)) {
-            $status = $existingStatus
-            $lastError = "$($existingFile.LastError)"
-        }
-        elseif ($status -ne "BlockedExtension" -and $existingStatus -in @("Uploaded", "SkippedExists") -and $existingHash -eq $fileHash) {
-            $status = $existingStatus
-            $lastError = "$($existingFile.LastError)"
-        }
-        elseif ($status -ne "BlockedExtension" -and $existingStatus -in @("Uploaded", "SkippedExists") -and $existingHash -ne $fileHash) {
+        elseif ($contentChanged) {
             $status = "Pending"
             $lastError = ""
+            $attemptCount = 0
+            $uploadedAt = $null
+        }
+        elseif ($restoredStatus -eq "DeletedRemote") {
+            $status = "Pending"
+            $lastError = ""
+            $attemptCount = 0
+            $uploadedAt = $null
+        }
+        elseif ($restoredStatus -in @("MissingLocalFile", "BlockedExtension")) {
+            $status = if ($null -ne $uploadedAt) { "Uploaded" } else { "Pending" }
+            $lastError = ""
+            $attemptCount = 0
+        }
+        else {
+            $status = $restoredStatus
+            $lastError = "$($existingFile.LastError)"
         }
 
-        if ($hashComparisonEnabled -and -not [string]::IsNullOrWhiteSpace($existingHash) -and $existingHash -ne $fileHash) {
+        if ($contentChanged) {
             $hashChanged = 1
             $lastHashChangedAt = (Get-Date).ToUniversalTime().ToString("o")
         }
-        elseif ($hashComparisonEnabled) {
-            $hashChanged = [int]$existingFile.HashChanged
-            $lastHashChangedAt = $existingFile.LastHashChangedAt
-        }
+
+        $statusChanged = $existingStatus -ne $status
     }
 
     $now = (Get-Date).ToUniversalTime().ToString("o")
     $targetUrl = "$targetFolder/$($File.Name)"
 
-    Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query @"
+    $upsertParameters = @{
+        Query = @"
 INSERT INTO Files (
     FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, SizeBytes, LastWriteTimeUtc,
-    TargetFolder, TargetUrl, Status, AttemptCount, LastError, LastInventorySeenAt,
+    TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
     CreatedAt, UpdatedAt, UploadedAt
 )
 VALUES (
     @FullPath, @RelativePath, @Extension, @FileHash, @PreviousFileHash, @HashChanged, @LastHashChangedAt, @SizeBytes, @LastWriteTimeUtc,
-    @TargetFolder, @TargetUrl, @Status, 0, @LastError, @LastInventorySeenAt,
-    @CreatedAt, @UpdatedAt, NULL
+    @TargetFolder, @TargetUrl, @Status, NULL, @AttemptCount, @LastError, @LastInventorySeenAt,
+    @CreatedAt, @UpdatedAt, @UploadedAt
 )
 ON CONFLICT(FullPath) DO UPDATE SET
     RelativePath = excluded.RelativePath,
@@ -489,15 +598,18 @@ ON CONFLICT(FullPath) DO UPDATE SET
     TargetFolder = excluded.TargetFolder,
     TargetUrl = excluded.TargetUrl,
     Status = excluded.Status,
+    StatusBeforeExclusion = NULL,
+    AttemptCount = excluded.AttemptCount,
     LastError = excluded.LastError,
     LastInventorySeenAt = excluded.LastInventorySeenAt,
-    UpdatedAt = excluded.UpdatedAt;
-"@ `
-        -SqlParameters @{
+    UpdatedAt = excluded.UpdatedAt,
+    UploadedAt = excluded.UploadedAt;
+"@
+        SqlParameters = @{
             FullPath         = $File.FullName
             RelativePath     = $relativePath
             Extension        = $extension
-            FileHash         = $fileHash
+            FileHash         = $FileHash
             PreviousFileHash = $previousFileHash
             HashChanged      = $hashChanged
             LastHashChangedAt = $lastHashChangedAt
@@ -506,11 +618,29 @@ ON CONFLICT(FullPath) DO UPDATE SET
             TargetFolder     = $targetFolder
             TargetUrl        = $targetUrl
             Status           = $status
+            AttemptCount     = $attemptCount
             LastError        = $lastError
             LastInventorySeenAt = $InventorySeenAt
             CreatedAt        = $now
             UpdatedAt        = $now
-        } | Out-Null
+            UploadedAt       = $uploadedAt
+        }
+    }
+    if ($null -ne $SQLiteConnection) {
+        $upsertParameters.SQLiteConnection = $SQLiteConnection
+    }
+    else {
+        $upsertParameters.DataSource = $DatabasePath
+    }
+
+    Invoke-SqliteQuery @upsertParameters | Out-Null
+
+    return [pscustomobject]@{
+        IsNew          = $isNew
+        ContentChanged = $contentChanged
+        StatusChanged  = $statusChanged
+        Status         = $status
+    }
 }
 
 function Update-MissingInventoryFiles {
@@ -519,28 +649,118 @@ function Update-MissingInventoryFiles {
         [string]$DatabasePath,
 
         [Parameter(Mandatory)]
-        [string]$InventorySeenAt
+        [string]$InventorySeenAt,
+
+        [object]$SQLiteConnection
     )
 
-    $candidates = @(Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "SELECT Id, FullPath, RelativePath FROM Files WHERE Status <> 'DeletedRemote' AND (LastInventorySeenAt IS NULL OR LastInventorySeenAt <> @InventorySeenAt);" `
-        -SqlParameters @{ InventorySeenAt = $InventorySeenAt } `
-        -As "PSObject")
-    $missingCount = 0
+    $queryParameters = @{
+        Query = @"
+SELECT COUNT(*) AS MissingCount
+FROM Files
+WHERE Status NOT IN ('DeletedRemote', 'Excluded')
+  AND (LastInventorySeenAt IS NULL OR LastInventorySeenAt <> @InventorySeenAt);
 
-    foreach ($candidate in $candidates) {
-        if (-not (Test-Path -LiteralPath $candidate.FullPath)) {
-            Update-MigrationFileStatus `
-                -DatabasePath $DatabasePath `
-                -Id $candidate.Id `
-                -Status "MissingLocalFile" `
-                -LastError "Fichier local absent lors du dernier inventaire"
-            $missingCount++
+UPDATE Files
+SET Status = 'MissingLocalFile',
+    LastError = 'Fichier local absent lors du dernier inventaire',
+    UpdatedAt = @UpdatedAt
+WHERE Status NOT IN ('DeletedRemote', 'Excluded')
+  AND (LastInventorySeenAt IS NULL OR LastInventorySeenAt <> @InventorySeenAt);
+"@
+        SqlParameters = @{
+            InventorySeenAt = $InventorySeenAt
+            UpdatedAt       = (Get-Date).ToUniversalTime().ToString("o")
         }
+        As = "PSObject"
+    }
+    if ($null -ne $SQLiteConnection) {
+        $queryParameters.SQLiteConnection = $SQLiteConnection
+    }
+    else {
+        $queryParameters.DataSource = $DatabasePath
     }
 
-    return $missingCount
+    $result = @(Invoke-SqliteQuery @queryParameters)
+    return [int]$result[0].MissingCount
+}
+
+function Set-MigrationFileExcluded {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo]$File,
+
+        [Parameter(Mandatory)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ServerRelativeRoot,
+
+        [Parameter(Mandatory)]
+        [string]$InventorySeenAt,
+
+        [object]$SQLiteConnection
+    )
+
+    $relativePath = Convert-ToSharePointRelativePath -BasePath $SourceRoot -FilePath $File.FullName
+    $relativeFolder = [System.IO.Path]::GetDirectoryName($relativePath)
+    $targetFolder = if ([string]::IsNullOrWhiteSpace($relativeFolder)) {
+        $ServerRelativeRoot
+    }
+    else {
+        "$ServerRelativeRoot/$($relativeFolder -replace '\\', '/')"
+    }
+    $extension = [System.IO.Path]::GetExtension($File.Name).Trim().TrimStart(".").ToLowerInvariant()
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    $queryParameters = @{
+        Query = @"
+INSERT INTO Files (
+    FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, SizeBytes, LastWriteTimeUtc,
+    TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
+    CreatedAt, UpdatedAt, UploadedAt
+)
+VALUES (
+    @FullPath, @RelativePath, @Extension, '', '', 0, @SizeBytes, @LastWriteTimeUtc,
+    @TargetFolder, @TargetUrl, 'Excluded', NULL, 0, 'Exclu par la configuration', @LastInventorySeenAt,
+    @CreatedAt, @UpdatedAt, NULL
+)
+ON CONFLICT(FullPath) DO UPDATE SET
+    RelativePath = excluded.RelativePath,
+    Extension = excluded.Extension,
+    SizeBytes = excluded.SizeBytes,
+    LastWriteTimeUtc = excluded.LastWriteTimeUtc,
+    TargetFolder = excluded.TargetFolder,
+    TargetUrl = excluded.TargetUrl,
+    StatusBeforeExclusion = CASE WHEN Files.Status = 'Excluded' THEN Files.StatusBeforeExclusion ELSE Files.Status END,
+    Status = 'Excluded',
+    LastError = 'Exclu par la configuration',
+    LastInventorySeenAt = excluded.LastInventorySeenAt,
+    UpdatedAt = excluded.UpdatedAt;
+"@
+        SqlParameters = @{
+            FullPath           = $File.FullName
+            RelativePath       = $relativePath
+            Extension          = $extension
+            SizeBytes          = $File.Length
+            LastWriteTimeUtc   = $File.LastWriteTimeUtc.ToString("o")
+            TargetFolder       = $targetFolder
+            TargetUrl          = "$targetFolder/$($File.Name)"
+            LastInventorySeenAt = $InventorySeenAt
+            CreatedAt          = $now
+            UpdatedAt          = $now
+        }
+    }
+    if ($null -ne $SQLiteConnection) {
+        $queryParameters.SQLiteConnection = $SQLiteConnection
+    }
+    else {
+        $queryParameters.DataSource = $DatabasePath
+    }
+
+    Invoke-SqliteQuery @queryParameters | Out-Null
 }
 
 function Reset-FailedMigrationFiles {
@@ -600,6 +820,7 @@ function Get-MigrationFileReportColumns {
         "TargetFolder",
         "TargetUrl",
         "Status",
+        "StatusBeforeExclusion",
         "AttemptCount",
         "LastError",
         "LastInventorySeenAt",
@@ -607,6 +828,50 @@ function Get-MigrationFileReportColumns {
         "UpdatedAt",
         "UploadedAt"
     )
+}
+
+function Export-MigrationFilesPaged {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [string]$Filter = "1 = 1",
+
+        [ValidateRange(100, 100000)]
+        [int]$BatchSize = 5000
+    )
+
+    $afterId = 0
+    $hasRows = $false
+
+    while ($true) {
+        $rows = @(Invoke-SqliteQuery `
+            -DataSource $DatabasePath `
+            -Query "SELECT * FROM Files WHERE Id > @AfterId AND ($Filter) ORDER BY Id LIMIT @BatchSize;" `
+            -SqlParameters @{ AfterId = $afterId; BatchSize = $BatchSize } `
+            -As "PSObject")
+
+        if ($rows.Count -eq 0) {
+            break
+        }
+
+        if ($hasRows) {
+            $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Append
+        }
+        else {
+            $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+            $hasRows = $true
+        }
+
+        $afterId = [int64]$rows[-1].Id
+    }
+
+    if (-not $hasRows) {
+        Export-CsvWithHeaders -Rows @() -Columns (Get-MigrationFileReportColumns) -Path $Path
+    }
 }
 
 function Get-MigrationFileByFullPath {
@@ -666,7 +931,7 @@ function Get-MigrationFilesToProcess {
     )
 
     $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
-    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND AttemptCount < @MaxAttemptsPerFile" } else { "" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (Status = 'Uploading' OR AttemptCount < @MaxAttemptsPerFile)" } else { "" }
 
     return @(Invoke-SqliteQuery `
         -DataSource $DatabasePath `
@@ -690,7 +955,7 @@ function Get-MigrationFilesToProcessCount {
     )
 
     $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
-    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND AttemptCount < @MaxAttemptsPerFile" } else { "" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (Status = 'Uploading' OR AttemptCount < @MaxAttemptsPerFile)" } else { "" }
 
     return [int](Invoke-SqliteQuery `
         -DataSource $DatabasePath `
@@ -738,6 +1003,8 @@ function Update-MigrationFileStatus {
     Invoke-SqliteQuery `
         -DataSource $DatabasePath `
         -Query @"
+PRAGMA busy_timeout=30000;
+
 UPDATE Files
 SET Status = @Status,
     LastError = @LastError,
@@ -786,25 +1053,14 @@ function Export-MigrationReport {
     $summaryPath = Join-Path $ReportDirectory ("migration_summary_{0}.csv" -f $timestamp)
     $errorReportPath = Join-Path $ReportDirectory ("migration_errors_{0}.csv" -f $timestamp)
     $changesReportPath = Join-Path $ReportDirectory ("migration_changes_{0}.csv" -f $timestamp)
-    $rows = @(Invoke-SqliteQuery -DataSource $DatabasePath -Query "SELECT * FROM Files ORDER BY Id;" -As "PSObject")
     $summaryRows = @(Invoke-SqliteQuery `
         -DataSource $DatabasePath `
         -Query "SELECT Status, COUNT(*) AS Count, COALESCE(SUM(SizeBytes), 0) AS TotalBytes FROM Files GROUP BY Status ORDER BY Status;" `
         -As "PSObject")
-    $errorRows = @(Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "SELECT * FROM Files WHERE Status IN ('Failed', 'MissingLocalFile') ORDER BY Status, RelativePath;" `
-        -As "PSObject")
-    $changedRows = @(Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "SELECT * FROM Files WHERE HashChanged = 1 ORDER BY LastHashChangedAt DESC, RelativePath;" `
-        -As "PSObject")
-
-    $fileColumns = Get-MigrationFileReportColumns
-    Export-CsvWithHeaders -Rows $rows -Columns $fileColumns -Path $reportPath
+    Export-MigrationFilesPaged -DatabasePath $DatabasePath -Path $reportPath
     Export-CsvWithHeaders -Rows $summaryRows -Columns @("Status", "Count", "TotalBytes") -Path $summaryPath
-    Export-CsvWithHeaders -Rows $errorRows -Columns $fileColumns -Path $errorReportPath
-    Export-CsvWithHeaders -Rows $changedRows -Columns $fileColumns -Path $changesReportPath
+    Export-MigrationFilesPaged -DatabasePath $DatabasePath -Path $errorReportPath -Filter "Status IN ('Failed', 'MissingLocalFile')"
+    Export-MigrationFilesPaged -DatabasePath $DatabasePath -Path $changesReportPath -Filter "HashChanged = 1"
 
     return [pscustomobject]@{
         DetailPath  = (Resolve-Path -LiteralPath $reportPath).Path
@@ -828,14 +1084,33 @@ function Export-MigrationErrorReport {
     }
 
     $errorReportPath = Join-Path $ReportDirectory ("migration_errors_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-    $rows = @(Invoke-SqliteQuery `
-        -DataSource $DatabasePath `
-        -Query "SELECT * FROM Files WHERE Status IN ('Failed', 'MissingLocalFile') ORDER BY Status, RelativePath;" `
-        -As "PSObject")
-
-    Export-CsvWithHeaders -Rows $rows -Columns (Get-MigrationFileReportColumns) -Path $errorReportPath
+    Export-MigrationFilesPaged `
+        -DatabasePath $DatabasePath `
+        -Path $errorReportPath `
+        -Filter "Status IN ('Failed', 'MissingLocalFile')"
 
     return (Resolve-Path -LiteralPath $errorReportPath).Path
+}
+
+function Export-MigrationBlockedExtensionReport {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [string]$ReportDirectory
+    )
+
+    if (-not (Test-Path -LiteralPath $ReportDirectory)) {
+        New-Item -ItemType Directory -Path $ReportDirectory -Force | Out-Null
+    }
+
+    $reportPath = Join-Path $ReportDirectory ("migration_blocked_extensions_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss_fff"))
+    Export-MigrationFilesPaged `
+        -DatabasePath $DatabasePath `
+        -Path $reportPath `
+        -Filter "Status = 'BlockedExtension'"
+    return (Resolve-Path -LiteralPath $reportPath).Path
 }
 
 function Remove-OldMigrationReports {

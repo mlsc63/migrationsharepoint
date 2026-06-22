@@ -4,6 +4,7 @@ function New-MigrationInventory {
         [System.IO.FileInfo[]]$Files,
 
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [string[]]$BlockedExtensions,
 
         [Parameter(Mandatory)]
@@ -25,10 +26,11 @@ function New-MigrationInventory {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         ForEach-Object { $_.Trim().TrimStart(".").ToLowerInvariant() }
 
-    $blockedItems = @()
+    $blockedItems = [System.Collections.Generic.List[object]]::new()
+    $blockedLines = [System.Collections.Generic.List[string]]::new()
     $migratableCount = 0
 
-    Set-Content -LiteralPath $blockedLogPath -Value "Fichiers non migrables a cause d'une extension bloquee"
+    Set-Content -LiteralPath $blockedLogPath -Value "Fichiers non migrables selon la politique d'extensions"
     Add-Content -LiteralPath $blockedLogPath -Value ("Date inventaire: {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
     Add-Content -LiteralPath $blockedLogPath -Value ""
 
@@ -39,15 +41,15 @@ function New-MigrationInventory {
 
         if (-not [string]::IsNullOrWhiteSpace($extension) -and $normalizedBlockedExtensions -contains $extension) {
             $line = "[BLOQUE] $relativePath - Path: $($file.FullName) - Extension: .$extension - Taille: $fileSize"
-            Add-Content -LiteralPath $blockedLogPath -Value $line
+            $blockedLines.Add($line)
 
-            $blockedItems += [pscustomobject]@{
+            $blockedItems.Add([pscustomobject]@{
                 Path      = $relativePath
                 FullPath  = $file.FullName
                 Extension = $extension
                 SizeBytes = $file.Length
                 Size      = $fileSize
-            }
+            })
 
             continue
         }
@@ -56,7 +58,10 @@ function New-MigrationInventory {
     }
 
     if ($blockedItems.Count -eq 0) {
-        Add-Content -LiteralPath $blockedLogPath -Value "Aucun fichier bloque par extension tenant."
+        Add-Content -LiteralPath $blockedLogPath -Value "Aucun fichier bloque par la politique d'extensions."
+    }
+    else {
+        Add-Content -LiteralPath $blockedLogPath -Value $blockedLines.ToArray()
     }
 
     return [pscustomobject]@{
@@ -64,6 +69,6 @@ function New-MigrationInventory {
         MigratableFiles  = $migratableCount
         BlockedFiles     = $blockedItems.Count
         BlockedLogPath   = (Resolve-Path -LiteralPath $blockedLogPath).Path
-        BlockedItems     = $blockedItems
+        BlockedItems     = $blockedItems.ToArray()
     }
 }

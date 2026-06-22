@@ -31,7 +31,7 @@ function Show-MigrationHelp {
     Write-Host "  -IncludeDeleted             Avec -DeltaInventory ou -CheckChanges, traite les fichiers disparus."
     Write-Host "  -CheckChanges               Genere un rapport de changements sans modifier les statuts."
     Write-Host "  -Migrate                    Migre les fichiers Pending depuis la base projet."
-    Write-Host "  -Resume                     Reprend Pending, Failed et Uploading selon les limites configurees."
+    Write-Host "  -Resume                     Reprend Pending/Failed et reconcilie toujours les Uploading."
     Write-Host "  -DeleteRemoteMissing        Avec -Migrate ou -Resume, supprime dans SharePoint les fichiers MissingLocalFile."
     Write-Host "  -Status                     Affiche le bilan par statut."
     Write-Host "  -ExportReport               Exporte detail, resume, erreurs et modifications en CSV."
@@ -51,15 +51,17 @@ function Show-MigrationHelp {
     Write-Host "  Destination.*               SiteUrl, Library, Folder."
     Write-Host "  Logging.LogDirectory        Dossier des logs."
     Write-Host "  Migration.HashMode          SHA256, Quick ou None."
+    Write-Host "  Migration.ParallelInventory Nombre de calculs d'empreinte simultanes. Defaut: 4."
     Write-Host "  Migration.MaxAttemptsPerFile Nombre max de tentatives par fichier. 0 = illimite."
     Write-Host "  Migration.MaxTotalErrors    Nombre max d'erreurs par execution. 0 = illimite."
     Write-Host "  Migration.ParallelUploads   Nombre d'uploads simultanes. Defaut: 4."
     Write-Host "  Migration.AssumeDestinationEmpty Ignore Get-PnPFile avant chaque upload."
+    Write-Host "  Migration.TreatTenantSyncExclusionsAsBlocked Politique optionnelle de compatibilite OneDrive."
     Write-Host "  Migration.ProcessingBatchSize Nombre de lignes SQLite chargees par page."
     Write-Host "  Exclusions.*                Motifs de fichiers/dossiers a ignorer."
     Write-Host ""
     Write-Host "Statuts base"
-    Write-Host "  Pending, Uploading, Uploaded, Failed, BlockedExtension, SkippedExists, MissingLocalFile, DeletedRemote"
+    Write-Host "  Pending, Uploading, Uploaded, Failed, BlockedExtension, Excluded, SkippedExists, MissingLocalFile, DeletedRemote"
     Write-Host ""
     Write-Host "Documentation complete: README.md"
     Write-Host ""
@@ -112,6 +114,8 @@ function Get-MigrationContext {
         throw "Fichier de configuration introuvable: $ConfigPath"
     }
 
+    $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    $configDirectory = Split-Path -Parent $ConfigPath
     [xml]$config = Get-Content -Raw -LiteralPath $ConfigPath
 
     $authNode = $config.Configuration.Authentication
@@ -124,20 +128,32 @@ function Get-MigrationContext {
     $destinationLibrary = Get-RequiredValue -Value $destinationNode.Library -Name "Destination.Library"
     $destinationFolder = $destinationNode.Folder
     $logDirectory = $config.Configuration.Logging.LogDirectory
+
+    if (-not [System.IO.Path]::IsPathRooted($sourcePath)) {
+        $sourcePath = Join-Path $configDirectory $sourcePath
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not [System.IO.Path]::IsPathRooted($logDirectory)) {
+        $logDirectory = Join-Path $configDirectory $logDirectory
+    }
     $migrationNode = $config.SelectSingleNode("/Configuration/Migration")
     $maxAttemptsPerFile = 3
     $maxTotalErrors = 1000
     $hashMode = "SHA256"
+    $parallelInventory = 4
     $parallelUploads = 4
     $assumeDestinationEmpty = $false
+    $treatTenantSyncExclusionsAsBlocked = $false
     $processingBatchSize = 1000
 
     if ($null -ne $migrationNode) {
         $maxAttemptsNode = $migrationNode.SelectSingleNode("MaxAttemptsPerFile")
         $maxTotalErrorsNode = $migrationNode.SelectSingleNode("MaxTotalErrors")
         $hashModeNode = $migrationNode.SelectSingleNode("HashMode")
+        $parallelInventoryNode = $migrationNode.SelectSingleNode("ParallelInventory")
         $parallelUploadsNode = $migrationNode.SelectSingleNode("ParallelUploads")
         $assumeDestinationEmptyNode = $migrationNode.SelectSingleNode("AssumeDestinationEmpty")
+        $tenantSyncExclusionsNode = $migrationNode.SelectSingleNode("TreatTenantSyncExclusionsAsBlocked")
         $processingBatchSizeNode = $migrationNode.SelectSingleNode("ProcessingBatchSize")
 
         if ($null -ne $maxAttemptsNode -and -not [string]::IsNullOrWhiteSpace($maxAttemptsNode.InnerText)) {
@@ -152,12 +168,20 @@ function Get-MigrationContext {
             $hashMode = "$($hashModeNode.InnerText)".Trim()
         }
 
+        if ($null -ne $parallelInventoryNode -and -not [string]::IsNullOrWhiteSpace($parallelInventoryNode.InnerText)) {
+            $parallelInventory = [int]$parallelInventoryNode.InnerText
+        }
+
         if ($null -ne $parallelUploadsNode -and -not [string]::IsNullOrWhiteSpace($parallelUploadsNode.InnerText)) {
             $parallelUploads = [int]$parallelUploadsNode.InnerText
         }
 
         if ($null -ne $assumeDestinationEmptyNode -and -not [string]::IsNullOrWhiteSpace($assumeDestinationEmptyNode.InnerText)) {
             $assumeDestinationEmpty = [System.Convert]::ToBoolean($assumeDestinationEmptyNode.InnerText)
+        }
+
+        if ($null -ne $tenantSyncExclusionsNode -and -not [string]::IsNullOrWhiteSpace($tenantSyncExclusionsNode.InnerText)) {
+            $treatTenantSyncExclusionsAsBlocked = [System.Convert]::ToBoolean($tenantSyncExclusionsNode.InnerText)
         }
 
         if ($null -ne $processingBatchSizeNode -and -not [string]::IsNullOrWhiteSpace($processingBatchSizeNode.InnerText)) {
@@ -169,8 +193,24 @@ function Get-MigrationContext {
         throw "Migration.ParallelUploads doit etre compris entre 1 et 16."
     }
 
+    if ($parallelInventory -lt 1 -or $parallelInventory -gt 16) {
+        throw "Migration.ParallelInventory doit etre compris entre 1 et 16."
+    }
+
     if ($processingBatchSize -lt 100 -or $processingBatchSize -gt 100000) {
         throw "Migration.ProcessingBatchSize doit etre compris entre 100 et 100000."
+    }
+
+    if ($maxAttemptsPerFile -lt 0) {
+        throw "Migration.MaxAttemptsPerFile doit etre superieur ou egal a 0."
+    }
+
+    if ($maxTotalErrors -lt 0) {
+        throw "Migration.MaxTotalErrors doit etre superieur ou egal a 0."
+    }
+
+    if ($hashMode -notin @("SHA256", "Quick", "None")) {
+        throw "Migration.HashMode invalide: $hashMode. Valeurs autorisees: SHA256, Quick, None."
     }
 
     $exclusionsNode = $config.SelectSingleNode("/Configuration/Exclusions")
@@ -198,7 +238,7 @@ function Get-MigrationContext {
 
     $sourceItem = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
     if (-not $sourceItem.PSIsContainer) {
-        throw "Source.Path doit etre un repertoire local: $sourcePath"
+        throw "Source.LocalPath doit etre un repertoire local: $sourcePath"
     }
 
     $sourceRoot = $sourceItem.FullName.TrimEnd("\", "/")
@@ -217,8 +257,10 @@ function Get-MigrationContext {
         MaxAttemptsPerFile    = $maxAttemptsPerFile
         MaxTotalErrors        = $maxTotalErrors
         HashMode              = $hashMode
+        ParallelInventory     = $parallelInventory
         ParallelUploads       = $parallelUploads
         AssumeDestinationEmpty = $assumeDestinationEmpty
+        TreatTenantSyncExclusionsAsBlocked = $treatTenantSyncExclusionsAsBlocked
         ProcessingBatchSize   = $processingBatchSize
     }
 }
@@ -273,11 +315,14 @@ function Test-MigrationPathExcluded {
 function Get-MigrationSourceFiles {
     param(
         [Parameter(Mandatory)]
-        [pscustomobject]$Context
+        [pscustomobject]$Context,
+
+        [switch]$Detailed
     )
 
     $files = @(Get-ChildItem -LiteralPath $Context.SourceRoot -File -Recurse)
-    $includedFiles = @()
+    $includedFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new($files.Count)
+    $excludedFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
     $excludedCount = 0
 
     foreach ($file in $files) {
@@ -288,18 +333,27 @@ function Get-MigrationSourceFiles {
                 -ExcludeFilePatterns $Context.ExcludeFilePatterns `
                 -ExcludeFolderPatterns $Context.ExcludeFolderPatterns) {
             Write-Log -Level "INFO" -Message "[EXCLU] $relativePath"
+            $excludedFiles.Add($file)
             $excludedCount++
             continue
         }
 
-        $includedFiles += $file
+        $includedFiles.Add($file)
     }
 
     if ($excludedCount -gt 0) {
         Write-Log -Level "INFO" -Message "Fichiers exclus par configuration: $excludedCount"
     }
 
-    return $includedFiles
+    if ($Detailed) {
+        return [pscustomobject]@{
+            IncludedFiles = $includedFiles.ToArray()
+            ExcludedFiles = $excludedFiles.ToArray()
+            TotalCount    = $files.Count
+        }
+    }
+
+    return $includedFiles.ToArray()
 }
 
 function Connect-MigrationSharePoint {
@@ -326,32 +380,40 @@ function Connect-MigrationSharePoint {
         -Thumbprint $Context.CertificateThumbprint
 }
 
-function Get-BlockedExtensionsForMigration {
+function Get-InventoryBlockedExtensions {
     param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
         [switch]$SkipConnection
     )
 
-    Write-Step "Recuperation des extensions bloquees au niveau du tenant"
+    if (-not $Context.TreatTenantSyncExclusionsAsBlocked) {
+        Write-Log -Level "INFO" -Message "Les exclusions de synchronisation OneDrive ne sont pas traitees comme des blocages d'upload."
+        return @()
+    }
+
+    Write-Step "Recuperation des extensions exclues de la synchronisation OneDrive"
 
     if ($SkipConnection) {
-        Write-Log -Level "WARN" -Message "Controle des extensions bloquees ignore en mode simulation, car aucune connexion SharePoint n'est effectuee."
+        Write-Log -Level "WARN" -Message "Lecture des exclusions de synchronisation ignoree car aucune connexion SharePoint n'est active."
         return @()
     }
 
     try {
-        $blockedExtensions = @(Get-TenantBlockedExtensions)
+        $blockedExtensions = @(Get-TenantSyncExcludedExtensions)
 
         if ($blockedExtensions.Count -gt 0) {
-            Write-Log -Level "INFO" -Message "Extensions bloquees par le tenant: $($blockedExtensions -join ', ')"
+            Write-Log -Level "WARN" -Message "Extensions de synchronisation traitees comme bloquees par la politique de migration: $($blockedExtensions -join ', ')"
         }
         else {
-            Write-Log -Level "INFO" -Message "Aucune extension bloquee n'a ete retournee par le tenant."
+            Write-Log -Level "INFO" -Message "Aucune extension exclue de la synchronisation OneDrive."
         }
 
         return $blockedExtensions
     }
     catch {
-        Write-Log -Level "ERROR" -Message "Impossible de recuperer les extensions bloquees du tenant: $($_.Exception.Message)"
+        Write-Log -Level "ERROR" -Message "Impossible de recuperer les exclusions de synchronisation OneDrive: $($_.Exception.Message)"
         throw
     }
 }
@@ -428,6 +490,102 @@ function Write-ProjectStatus {
     Write-Host ("Total: {0}" -f $total)
 }
 
+function Get-MigrationFileFingerprintsParallel {
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo[]]$Files,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "Quick", "None")]
+        [string]$HashMode,
+
+        [ValidateRange(1, 16)]
+        [int]$ThrottleLimit = 4
+    )
+
+    return @($Files | ForEach-Object -Parallel {
+        $file = $_
+        $hashMode = $using:HashMode
+
+        try {
+            $fileHash = switch ($hashMode.ToUpperInvariant()) {
+                "NONE" { "" }
+                "QUICK" { "QUICK:$($file.Length):$($file.LastWriteTimeUtc.Ticks)" }
+                "SHA256" { "SHA256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash)" }
+            }
+
+            [pscustomobject]@{
+                FullPath = $file.FullName
+                FileHash = $fileHash
+                Error    = ""
+            }
+        }
+        catch {
+            [pscustomobject]@{
+                FullPath = $file.FullName
+                FileHash = ""
+                Error    = $_.Exception.Message
+            }
+        }
+    } -ThrottleLimit $ThrottleLimit)
+}
+
+function Assert-MigrationFingerprintBatch {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Fingerprints
+    )
+
+    $failures = @($Fingerprints | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Error) })
+    if ($failures.Count -eq 0) {
+        return
+    }
+
+    foreach ($failure in $failures) {
+        Write-Log -Level "ERROR" -Message "[EMPREINTE] $($failure.FullPath) - $($failure.Error)"
+    }
+
+    throw "$($failures.Count) empreinte(s) de fichier n'ont pas pu etre calculees."
+}
+
+function Get-PreparedMigrationFingerprints {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.IO.FileInfo[]]$Files,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$ProgressLabel
+    )
+
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "Les inventaires paralleles necessitent PowerShell 7 ou plus recent."
+    }
+
+    $prepared = [System.Collections.Generic.List[object]]::new($Files.Count)
+    for ($offset = 0; $offset -lt $Files.Count; $offset += $Context.ProcessingBatchSize) {
+        $lastIndex = [Math]::Min($offset + $Context.ProcessingBatchSize - 1, $Files.Count - 1)
+        $batch = @($Files[$offset..$lastIndex])
+        $fingerprints = @(Get-MigrationFileFingerprintsParallel `
+                -Files $batch `
+                -HashMode $Context.HashMode `
+                -ThrottleLimit $Context.ParallelInventory)
+
+        Assert-MigrationFingerprintBatch -Fingerprints $fingerprints
+        foreach ($fingerprint in $fingerprints) {
+            $prepared.Add($fingerprint)
+        }
+
+        Write-Log -Level "INFO" -Message "${ProgressLabel}: $($prepared.Count)/$($Files.Count)"
+    }
+
+    return $prepared.ToArray()
+}
+
 function Invoke-ProjectInventory {
     param(
         [Parameter(Mandatory)]
@@ -439,34 +597,76 @@ function Invoke-ProjectInventory {
         [string[]]$BlockedExtensions
     )
 
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "L'inventaire projet necessite PowerShell 7 ou plus recent."
+    }
+
     $runId = Start-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -Mode "Inventory"
 
     try {
         $inventorySeenAt = (Get-Date).ToUniversalTime().ToString("o")
-        $files = @(Get-MigrationSourceFiles -Context $Context)
-        Write-Step "$($files.Count) fichier(s) detecte(s) dans $($Context.SourceRoot)"
+        $sourceInventory = Get-MigrationSourceFiles -Context $Context -Detailed
+        $files = @($sourceInventory.IncludedFiles)
+        $excludedFiles = @($sourceInventory.ExcludedFiles)
+        Write-Step "$($sourceInventory.TotalCount) fichier(s) detecte(s) dans $($Context.SourceRoot)"
         Write-Log -Level "INFO" -Message "Mode de hash inventaire: $($Context.HashMode)"
-        Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath
+        Write-Log -Level "INFO" -Message "Calculs d'empreinte paralleles: $($Context.ParallelInventory)"
 
         if ($Context.HashMode -eq "None") {
             Write-Log -Level "WARN" -Message "HashMode=None: les modifications locales ne seront pas detectees par hash."
         }
 
-        foreach ($file in $files) {
-            Upsert-MigrationFile `
+        $preparedFiles = @(Get-PreparedMigrationFingerprints `
+                -Files $files `
+                -Context $Context `
+                -ProgressLabel "Preparation inventaire")
+
+        $transactionResult = Invoke-MigrationDatabaseTransaction -DatabasePath $ProjectInfo.DatabasePath -Action {
+            param($connection)
+
+            Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
+
+            foreach ($fingerprint in $preparedFiles) {
+                $null = Upsert-MigrationFile `
+                    -DatabasePath $ProjectInfo.DatabasePath `
+                    -File ([System.IO.FileInfo]::new($fingerprint.FullPath)) `
+                    -SourceRoot $Context.SourceRoot `
+                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                    -BlockedExtensions $BlockedExtensions `
+                    -InventorySeenAt $inventorySeenAt `
+                    -HashMode $Context.HashMode `
+                    -FileHash $fingerprint.FileHash `
+                    -FingerprintProvided `
+                    -SQLiteConnection $connection
+            }
+
+            foreach ($file in $excludedFiles) {
+                Set-MigrationFileExcluded `
+                    -DatabasePath $ProjectInfo.DatabasePath `
+                    -File $file `
+                    -SourceRoot $Context.SourceRoot `
+                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                    -InventorySeenAt $inventorySeenAt `
+                    -SQLiteConnection $connection
+            }
+
+            $missing = Update-MissingInventoryFiles `
                 -DatabasePath $ProjectInfo.DatabasePath `
-                -File $file `
-                -SourceRoot $Context.SourceRoot `
-                -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
-                -BlockedExtensions $BlockedExtensions `
                 -InventorySeenAt $inventorySeenAt `
-                -HashMode $Context.HashMode
+                -SQLiteConnection $connection
+
+            [pscustomobject]@{ MissingCount = $missing }
         }
 
-        $missingCount = Update-MissingInventoryFiles -DatabasePath $ProjectInfo.DatabasePath -InventorySeenAt $inventorySeenAt
+        $missingCount = [int]$transactionResult.MissingCount
         if ($missingCount -gt 0) {
             Write-Log -Level "WARN" -Message "Fichiers marques MissingLocalFile pendant l'inventaire: $missingCount"
         }
+
+        $blockedReportPath = Export-MigrationBlockedExtensionReport `
+            -DatabasePath $ProjectInfo.DatabasePath `
+            -ReportDirectory $ProjectInfo.ReportDirectory
+        Write-Log -Level "INFO" -Message "Rapport des extensions bloquees: $blockedReportPath"
 
         Complete-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -RunId $runId -Result "Success" -Message "Inventaire termine"
         Write-Log -Level "INFO" -Message "Inventaire projet termine dans la base: $($ProjectInfo.DatabasePath)"
@@ -491,82 +691,112 @@ function Invoke-ProjectDeltaInventory {
         [switch]$IncludeDeleted
     )
 
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "Le delta inventaire necessite PowerShell 7 ou plus recent."
+    }
+
     $runId = Start-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -Mode "DeltaInventory"
 
     try {
         $inventorySeenAt = (Get-Date).ToUniversalTime().ToString("o")
-        $files = @(Get-MigrationSourceFiles -Context $Context)
-        $newCount = 0
-        $changedCount = 0
-        $unchangedCount = 0
+        $sourceInventory = Get-MigrationSourceFiles -Context $Context -Detailed
+        $files = @($sourceInventory.IncludedFiles)
+        $excludedFiles = @($sourceInventory.ExcludedFiles)
 
-        Write-Step "Delta inventaire: $($files.Count) fichier(s) detecte(s) dans $($Context.SourceRoot)"
+        Write-Step "Delta inventaire: $($sourceInventory.TotalCount) fichier(s) detecte(s) dans $($Context.SourceRoot)"
         Write-Log -Level "INFO" -Message "Mode de hash delta: $($Context.HashMode)"
-        Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath
+        Write-Log -Level "INFO" -Message "Calculs d'empreinte paralleles: $($Context.ParallelInventory)"
 
         if ($Context.HashMode -eq "None") {
             Write-Log -Level "WARN" -Message "HashMode=None: seuls les nouveaux fichiers seront detectes de facon fiable."
         }
 
-        foreach ($file in $files) {
-            $existingFile = Get-MigrationFileByFullPath -DatabasePath $ProjectInfo.DatabasePath -FullPath $file.FullName
-            $currentHash = Get-MigrationFileFingerprint -File $file -HashMode $Context.HashMode
+        $preparedFiles = @(Get-PreparedMigrationFingerprints `
+                -Files $files `
+                -Context $Context `
+                -ProgressLabel "Preparation delta inventaire")
 
-            if ($null -eq $existingFile) {
-                Upsert-MigrationFile `
+        $transactionResult = Invoke-MigrationDatabaseTransaction -DatabasePath $ProjectInfo.DatabasePath -Action {
+            param($connection)
+
+            $newCount = 0
+            $changedCount = 0
+            $statusChangedCount = 0
+            $unchangedCount = 0
+            Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
+
+            foreach ($fingerprint in $preparedFiles) {
+                $file = [System.IO.FileInfo]::new($fingerprint.FullPath)
+                $upsertResult = Upsert-MigrationFile `
                     -DatabasePath $ProjectInfo.DatabasePath `
                     -File $file `
                     -SourceRoot $Context.SourceRoot `
                     -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
                     -BlockedExtensions $BlockedExtensions `
                     -InventorySeenAt $inventorySeenAt `
-                    -HashMode $Context.HashMode
-                $newCount++
-                continue
-            }
+                    -HashMode $Context.HashMode `
+                    -FileHash $fingerprint.FileHash `
+                    -FingerprintProvided `
+                    -SQLiteConnection $connection
 
-            $existingHash = "$($existingFile.FileHash)"
-            if ($Context.HashMode -eq "None") {
-                Update-MigrationFileInventorySeen `
-                    -DatabasePath $ProjectInfo.DatabasePath `
-                    -Id $existingFile.Id `
-                    -InventorySeenAt $inventorySeenAt
+                if ($upsertResult.IsNew) {
+                    $newCount++
+                    continue
+                }
+
+                if ($upsertResult.ContentChanged) {
+                    $changedCount++
+                    continue
+                }
+
+                if ($upsertResult.StatusChanged) {
+                    $statusChangedCount++
+                    continue
+                }
+
                 $unchangedCount++
-                continue
             }
 
-            if ([string]::IsNullOrWhiteSpace($existingHash) -or $existingHash -ne $currentHash) {
-                Upsert-MigrationFile `
+            foreach ($file in $excludedFiles) {
+                Set-MigrationFileExcluded `
                     -DatabasePath $ProjectInfo.DatabasePath `
                     -File $file `
                     -SourceRoot $Context.SourceRoot `
                     -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
-                    -BlockedExtensions $BlockedExtensions `
                     -InventorySeenAt $inventorySeenAt `
-                    -HashMode $Context.HashMode
-                $changedCount++
-                continue
+                    -SQLiteConnection $connection
             }
 
-            Update-MigrationFileInventorySeen `
-                -DatabasePath $ProjectInfo.DatabasePath `
-                -Id $existingFile.Id `
-                -InventorySeenAt $inventorySeenAt
-            $unchangedCount++
-        }
+            $missingCount = 0
+            if ($IncludeDeleted) {
+                $missingCount = Update-MissingInventoryFiles `
+                    -DatabasePath $ProjectInfo.DatabasePath `
+                    -InventorySeenAt $inventorySeenAt `
+                    -SQLiteConnection $connection
+            }
 
-        $missingCount = 0
-        if ($IncludeDeleted) {
-            $missingCount = Update-MissingInventoryFiles -DatabasePath $ProjectInfo.DatabasePath -InventorySeenAt $inventorySeenAt
-            if ($missingCount -gt 0) {
-                Write-Log -Level "WARN" -Message "Fichiers marques MissingLocalFile pendant le delta: $missingCount"
+            [pscustomobject]@{
+                NewCount           = $newCount
+                ChangedCount       = $changedCount
+                StatusChangedCount = $statusChangedCount
+                UnchangedCount     = $unchangedCount
+                MissingCount       = $missingCount
             }
         }
-        else {
+
+        $missingCount = [int]$transactionResult.MissingCount
+        if ($IncludeDeleted -and $missingCount -gt 0) {
+            Write-Log -Level "WARN" -Message "Fichiers marques MissingLocalFile pendant le delta: $missingCount"
+        }
+        elseif (-not $IncludeDeleted) {
             Write-Log -Level "INFO" -Message "Fichiers supprimes ignores pendant le delta. Utilise -IncludeDeleted pour les marquer MissingLocalFile."
         }
 
-        $summary = "Nouveaux: $newCount; Modifies: $changedCount; Inchanges: $unchangedCount; Supprimes marques: $missingCount"
+        $summary = "Nouveaux: $($transactionResult.NewCount); Modifies: $($transactionResult.ChangedCount); Statuts ajustes: $($transactionResult.StatusChangedCount); Inchanges: $($transactionResult.UnchangedCount); Supprimes marques: $missingCount"
+        $blockedReportPath = Export-MigrationBlockedExtensionReport `
+            -DatabasePath $ProjectInfo.DatabasePath `
+            -ReportDirectory $ProjectInfo.ReportDirectory
+        Write-Log -Level "INFO" -Message "Rapport des extensions bloquees: $blockedReportPath"
         Complete-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -RunId $runId -Result "Success" -Message $summary
         Write-Log -Level "INFO" -Message "Delta inventaire termine dans la base: $($ProjectInfo.DatabasePath)"
         Write-Log -Level "INFO" -Message $summary
@@ -589,6 +819,10 @@ function Invoke-ProjectCheckChanges {
         [switch]$IncludeDeleted
     )
 
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "Le controle des changements necessite PowerShell 7 ou plus recent."
+    }
+
     if (-not (Test-Path -LiteralPath $ProjectInfo.ReportDirectory)) {
         New-Item -ItemType Directory -Path $ProjectInfo.ReportDirectory -Force | Out-Null
     }
@@ -599,7 +833,7 @@ function Invoke-ProjectCheckChanges {
     try {
         $files = @(Get-MigrationSourceFiles -Context $Context)
         $seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $changes = @()
+        $changes = [System.Collections.Generic.List[object]]::new()
 
         Write-Step "Controle des changements: $($files.Count) fichier(s) detecte(s) dans $($Context.SourceRoot)"
         Write-Log -Level "INFO" -Message "Mode de hash controle: $($Context.HashMode)"
@@ -608,14 +842,20 @@ function Invoke-ProjectCheckChanges {
             Write-Log -Level "WARN" -Message "HashMode=None: les modifications locales ne seront pas detectees par hash."
         }
 
-        foreach ($file in $files) {
+        $preparedFiles = @(Get-PreparedMigrationFingerprints `
+                -Files $files `
+                -Context $Context `
+                -ProgressLabel "Preparation controle changements")
+
+        foreach ($fingerprint in $preparedFiles) {
+            $file = [System.IO.FileInfo]::new($fingerprint.FullPath)
             [void]$seenPaths.Add($file.FullName)
             $relativePath = Convert-ToSharePointRelativePath -BasePath $Context.SourceRoot -FilePath $file.FullName
-            $currentHash = Get-MigrationFileFingerprint -File $file -HashMode $Context.HashMode
+            $currentHash = $fingerprint.FileHash
             $existingFile = Get-MigrationFileByFullPath -DatabasePath $ProjectInfo.DatabasePath -FullPath $file.FullName
 
             if ($null -eq $existingFile) {
-                $changes += [pscustomobject]@{
+                $changes.Add([pscustomobject]@{
                     ChangeType       = "New"
                     RelativePath     = $relativePath
                     FullPath         = $file.FullName
@@ -624,13 +864,13 @@ function Invoke-ProjectCheckChanges {
                     CurrentFileHash  = $currentHash
                     SizeBytes        = $file.Length
                     LastWriteTimeUtc = $file.LastWriteTimeUtc.ToString("o")
-                }
+                })
                 continue
             }
 
             $existingHash = "$($existingFile.FileHash)"
             if ($Context.HashMode -ne "None" -and -not [string]::IsNullOrWhiteSpace($existingHash) -and $existingHash -ne $currentHash) {
-                $changes += [pscustomobject]@{
+                $changes.Add([pscustomobject]@{
                     ChangeType       = "Modified"
                     RelativePath     = $relativePath
                     FullPath         = $file.FullName
@@ -639,7 +879,7 @@ function Invoke-ProjectCheckChanges {
                     CurrentFileHash  = $currentHash
                     SizeBytes        = $file.Length
                     LastWriteTimeUtc = $file.LastWriteTimeUtc.ToString("o")
-                }
+                })
             }
         }
 
@@ -647,7 +887,7 @@ function Invoke-ProjectCheckChanges {
             $knownFiles = @(Invoke-SqliteQuery -DataSource $ProjectInfo.DatabasePath -Query "SELECT FullPath, RelativePath, Status, FileHash, SizeBytes, LastWriteTimeUtc FROM Files WHERE Status <> 'DeletedRemote' ORDER BY RelativePath;" -As "PSObject")
             foreach ($knownFile in $knownFiles) {
                 if (-not $seenPaths.Contains("$($knownFile.FullPath)") -and -not (Test-Path -LiteralPath $knownFile.FullPath)) {
-                    $changes += [pscustomobject]@{
+                    $changes.Add([pscustomobject]@{
                         ChangeType       = "Deleted"
                         RelativePath     = $knownFile.RelativePath
                         FullPath         = $knownFile.FullPath
@@ -656,13 +896,13 @@ function Invoke-ProjectCheckChanges {
                         CurrentFileHash  = ""
                         SizeBytes        = $knownFile.SizeBytes
                         LastWriteTimeUtc = $knownFile.LastWriteTimeUtc
-                    }
+                    })
                 }
             }
         }
 
         Export-CsvWithHeaders `
-            -Rows $changes `
+            -Rows $changes.ToArray() `
             -Columns @("ChangeType", "RelativePath", "FullPath", "Status", "PreviousFileHash", "CurrentFileHash", "SizeBytes", "LastWriteTimeUtc") `
             -Path $reportPath
         $summary = "Changements detectes: $($changes.Count)"
@@ -697,6 +937,8 @@ function Invoke-ParallelMigrationUploads {
         [ValidateRange(1, 1000)]
         [int]$TaskSize = 25,
 
+        [int]$MaxAttemptsPerFile = 3,
+
         [switch]$Overwrite,
 
         [switch]$AssumeDestinationEmpty
@@ -714,9 +956,11 @@ function Invoke-ParallelMigrationUploads {
     $tenantId = $Context.TenantId
     $clientId = $Context.ClientId
     $certificateThumbprint = $Context.CertificateThumbprint
+    $destinationRoot = $Context.Destination.ServerRelativeRoot.TrimEnd("/")
     $databasePathValue = $DatabasePath
     $overwriteEnabled = [bool]$Overwrite
     $skipExistenceCheck = [bool]$AssumeDestinationEmpty
+    $maxAttempts = $MaxAttemptsPerFile
 
     $folderTasks = @($Rows | Group-Object -Property TargetFolder | ForEach-Object {
         $folderRows = @($_.Group)
@@ -733,6 +977,7 @@ function Invoke-ParallelMigrationUploads {
     $folderTasks | ForEach-Object -Parallel {
         $task = $_
         $operation = "Connexion SharePoint"
+        $rootFolder = $using:destinationRoot
 
         function Test-PnPNotFoundError {
             param([System.Management.Automation.ErrorRecord]$ErrorRecord)
@@ -780,16 +1025,17 @@ function Invoke-ParallelMigrationUploads {
 
             $connection = $script:MigrationPnPConnection
             $operation = "Creation/verification du dossier SharePoint"
-            $parts = @($task.TargetFolder.Trim("/") -split "/" | Where-Object { $_ })
-
-            if ($parts.Count -lt 3) {
+            $targetFolder = "$($task.TargetFolder)".TrimEnd("/")
+            if ($targetFolder -ne $rootFolder -and -not $targetFolder.StartsWith("$rootFolder/", [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "Chemin SharePoint invalide: $($task.TargetFolder)"
             }
 
-            $currentFolder = "/$($parts[0])/$($parts[1])/$($parts[2])"
+            $currentFolder = $rootFolder
             Get-PnPFolder -Url $currentFolder -Connection $connection -ErrorAction Stop | Out-Null
+            $relativeFolder = $targetFolder.Substring($rootFolder.Length).Trim("/")
+            $parts = @($relativeFolder -split "/" | Where-Object { $_ })
 
-            for ($i = 3; $i -lt $parts.Count; $i++) {
+            for ($i = 0; $i -lt $parts.Count; $i++) {
                 $parentFolder = $currentFolder
                 $currentFolder = "$currentFolder/$($parts[$i])"
 
@@ -817,30 +1063,25 @@ function Invoke-ParallelMigrationUploads {
                     RelativePath = "$($row.RelativePath)"
                     TargetUrl    = "$($row.TargetUrl)"
                     SizeBytes    = [long]$row.SizeBytes
-                    Status       = "Failed"
+                    Status       = if ("$($row.Status)" -eq "Uploading") { "RetryUncertain" } else { "Failed" }
                     Message      = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
-                    AttemptStarted = $false
+                    AttemptStarted = "$($row.Status)" -eq "Uploading"
                 }
             }
             return
         }
 
         foreach ($row in $task.Rows) {
-            $operation = "Initialisation de la tentative SQLite"
-            $attemptStarted = $false
+            $isInterruptedUpload = "$($row.Status)" -eq "Uploading"
+            $operation = "Verification de l'existence du fichier SharePoint"
+            $attemptStarted = $isInterruptedUpload
+            $newAttemptStarted = $false
 
             try {
-                $now = (Get-Date).ToUniversalTime().ToString("o")
-                Invoke-SqliteQuery `
-                    -DataSource $using:databasePathValue `
-                    -Query "PRAGMA busy_timeout=30000; UPDATE Files SET Status = 'Uploading', LastError = '', UpdatedAt = @UpdatedAt, AttemptCount = AttemptCount + 1 WHERE Id = @Id;" `
-                    -SqlParameters @{ UpdatedAt = $now; Id = [int]$row.Id } | Out-Null
-                $attemptStarted = $true
                 $fileExists = $false
-                $mustCheckExistence = (-not $using:skipExistenceCheck) -or "$($row.Status)" -eq "Uploading"
+                $mustCheckExistence = (-not $using:skipExistenceCheck) -or $isInterruptedUpload
 
                 if ($mustCheckExistence) {
-                    $operation = "Verification de l'existence du fichier SharePoint"
                     try {
                         Get-PnPFile -Url $row.TargetUrl -Connection $connection -ErrorAction Stop | Out-Null
                         $fileExists = $true
@@ -855,18 +1096,40 @@ function Invoke-ParallelMigrationUploads {
                     }
                 }
 
-                if ($fileExists -and -not $using:overwriteEnabled) {
+                if ($fileExists -and ((-not $using:overwriteEnabled) -or $isInterruptedUpload)) {
                     [pscustomobject]@{
                         Id             = [int]$row.Id
                         RelativePath   = "$($row.RelativePath)"
                         TargetUrl      = "$($row.TargetUrl)"
                         SizeBytes      = [long]$row.SizeBytes
                         Status         = "SkippedExists"
-                        Message        = "Existe deja dans SharePoint"
-                        AttemptStarted = $attemptStarted
+                        Message        = if ($isInterruptedUpload) { "Upload precedent confirme dans SharePoint" } else { "Existe deja dans SharePoint" }
+                        AttemptStarted = $true
                     }
                     continue
                 }
+
+                if ($isInterruptedUpload -and $using:maxAttempts -gt 0 -and [int]$row.AttemptCount -ge $using:maxAttempts) {
+                    [pscustomobject]@{
+                        Id             = [int]$row.Id
+                        RelativePath   = "$($row.RelativePath)"
+                        TargetUrl      = "$($row.TargetUrl)"
+                        SizeBytes      = [long]$row.SizeBytes
+                        Status         = "Failed"
+                        Message        = "Upload precedent absent de SharePoint et limite de tentatives atteinte ($($row.AttemptCount)/$using:maxAttempts)"
+                        AttemptStarted = $true
+                    }
+                    continue
+                }
+
+                $operation = "Initialisation de la tentative SQLite"
+                $now = (Get-Date).ToUniversalTime().ToString("o")
+                Invoke-SqliteQuery `
+                    -DataSource $using:databasePathValue `
+                    -Query "PRAGMA busy_timeout=30000; UPDATE Files SET Status = 'Uploading', LastError = '', UpdatedAt = @UpdatedAt, AttemptCount = AttemptCount + 1 WHERE Id = @Id;" `
+                    -SqlParameters @{ UpdatedAt = $now; Id = [int]$row.Id } | Out-Null
+                $attemptStarted = $true
+                $newAttemptStarted = $true
 
                 if ($fileExists -and $using:overwriteEnabled) {
                     $operation = "Suppression du fichier cible avant ecrasement"
@@ -892,7 +1155,7 @@ function Invoke-ParallelMigrationUploads {
                     RelativePath   = "$($row.RelativePath)"
                     TargetUrl      = "$($row.TargetUrl)"
                     SizeBytes      = [long]$row.SizeBytes
-                    Status         = "Failed"
+                    Status         = if ($isInterruptedUpload -and -not $newAttemptStarted) { "RetryUncertain" } else { "Failed" }
                     Message        = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
                     AttemptStarted = $attemptStarted
                 }
@@ -928,11 +1191,13 @@ function Invoke-ProjectMigration {
         -DatabasePath $ProjectInfo.DatabasePath `
         -IncludeFailed:$IncludeFailed `
         -MaxAttemptsPerFile $Context.MaxAttemptsPerFile
-    $remoteDeleteCandidates = @()
+    $remoteDeleteCandidates = [System.Collections.Generic.List[object]]::new()
     if ($DeleteRemoteMissing) {
-        $remoteDeleteCandidates = @(Get-MigrationRemoteDeleteCandidates `
-            -DatabasePath $ProjectInfo.DatabasePath `
-            -MaxAttemptsPerFile $Context.MaxAttemptsPerFile)
+        foreach ($candidate in @(Get-MigrationRemoteDeleteCandidates `
+                -DatabasePath $ProjectInfo.DatabasePath `
+                -MaxAttemptsPerFile $Context.MaxAttemptsPerFile)) {
+            $remoteDeleteCandidates.Add($candidate)
+        }
     }
     $runMode = if ($IncludeFailed) { "Resume" } else { "Migrate" }
     $runId = Start-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -Mode $runMode
@@ -988,7 +1253,7 @@ function Invoke-ProjectMigration {
                     }
                     else {
                         Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
-                        $remoteDeleteCandidates += $row
+                        $remoteDeleteCandidates.Add($row)
                     }
                 }
                 else {
@@ -1014,6 +1279,7 @@ function Invoke-ProjectMigration {
                 -Context $Context `
                 -DatabasePath $ProjectInfo.DatabasePath `
                 -ThrottleLimit $ParallelUploads `
+                -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
                 -Overwrite:$Overwrite `
                 -AssumeDestinationEmpty:$AssumeDestinationEmpty |
                 ForEach-Object {
@@ -1031,6 +1297,14 @@ function Invoke-ProjectMigration {
                         Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "SkippedExists" -LastError $result.Message -IncrementAttempt:$incrementAttempt
                         Write-Log -Level "WARN" -Message "[SKIP] Existe deja: $($result.TargetUrl) - Taille: $fileSize"
                         $skipped++
+                    }
+                    "RetryUncertain" {
+                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Uploading" -LastError $result.Message
+                        Write-Log -Level "ERROR" -Message "[INCERTAIN] $($result.RelativePath) - Taille: $fileSize - $($result.Message)"
+                        $failed++
+                        if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
+                            throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
+                        }
                     }
                     default {
                         Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Failed" -LastError $result.Message -IncrementAttempt:$incrementAttempt
@@ -1095,7 +1369,8 @@ function Invoke-ProjectMigration {
         }
 
         $summary = "Envoyes: $uploaded; Ignores: $skipped; Supprimes distants: $deletedRemote; Erreurs: $failed"
-        Complete-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -RunId $runId -Result "Success" -Message $summary
+        $runResult = if ($failed -gt 0) { "PartialSuccess" } else { "Success" }
+        Complete-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -RunId $runId -Result $runResult -Message $summary
         Write-Step "Migration projet terminee"
         Write-Log -Level "INFO" -Message $summary
         Write-ProjectStatus -ProjectInfo $ProjectInfo
@@ -1138,7 +1413,7 @@ function Invoke-LegacyMigration {
         Write-Log -Level "INFO" -Message "Inventaire termine"
         Write-Log -Level "INFO" -Message "Fichiers analyses : $($inventoryResult.TotalFiles)"
         Write-Log -Level "INFO" -Message "Fichiers migrables : $($inventoryResult.MigratableFiles)"
-        Write-Log -Level "INFO" -Message "Fichiers bloques par extension tenant : $($inventoryResult.BlockedFiles)"
+        Write-Log -Level "INFO" -Message "Fichiers bloques par la politique d'extensions : $($inventoryResult.BlockedFiles)"
         Write-Log -Level "INFO" -Message "Journal des fichiers bloques : $($inventoryResult.BlockedLogPath)"
         Write-Log -Level "INFO" -Message "Aucun upload effectue en mode inventaire."
         return
@@ -1167,7 +1442,7 @@ function Invoke-LegacyMigration {
             $fileExtension = [System.IO.Path]::GetExtension($file.Name).Trim().TrimStart(".").ToLowerInvariant()
 
             if (-not [string]::IsNullOrWhiteSpace($fileExtension) -and $BlockedExtensions -contains $fileExtension) {
-                Write-Log -Level "WARN" -Message "[BLOQUE] Extension interdite par le tenant: $relativePath (.$fileExtension) - Taille: $fileSize"
+                Write-Log -Level "WARN" -Message "[BLOQUE] Extension exclue par la politique de migration: $relativePath (.$fileExtension) - Taille: $fileSize"
                 $blocked++
                 $skipped++
                 continue
@@ -1179,7 +1454,10 @@ function Invoke-LegacyMigration {
             }
 
             $currentOperation = "Creation/verification du dossier SharePoint"
-            Ensure-RemoteFolder -ServerRelativeFolder $targetFolder -WhatIf:$WhatIf
+            Ensure-RemoteFolder `
+                -ServerRelativeFolder $targetFolder `
+                -ExistingRoot $Context.Destination.ServerRelativeRoot `
+                -WhatIf:$WhatIf
 
             $existingFileUrl = "$targetFolder/$($file.Name)"
             $fileExists = $false
@@ -1223,7 +1501,7 @@ function Invoke-LegacyMigration {
     Write-Step "Migration terminee"
     Write-Log -Level "INFO" -Message "Envoyes : $uploaded"
     Write-Log -Level "INFO" -Message "Ignores : $skipped"
-    Write-Log -Level "INFO" -Message "Bloques par extension tenant : $blocked"
+    Write-Log -Level "INFO" -Message "Bloques par la politique d'extensions : $blocked"
     Write-Log -Level "INFO" -Message "Erreurs : $failed"
 
     if ($failed -gt 0) {

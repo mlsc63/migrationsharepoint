@@ -22,10 +22,12 @@
 
     <Migration>
         <HashMode>SHA256</HashMode>
+        <ParallelInventory>4</ParallelInventory>
         <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
         <MaxTotalErrors>1000</MaxTotalErrors>
         <ParallelUploads>4</ParallelUploads>
         <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+        <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
         <ProcessingBatchSize>1000</ProcessingBatchSize>
     </Migration>
 

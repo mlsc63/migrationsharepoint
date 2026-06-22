@@ -37,6 +37,35 @@ if ($Help) {
     return
 }
 
+$requestedActions = @(
+    if ($NewProject) { "NewProject" }
+    if ($Inventory) { "Inventory" }
+    if ($DeltaInventory) { "DeltaInventory" }
+    if ($CheckChanges) { "CheckChanges" }
+    if ($Migrate) { "Migrate" }
+    if ($Resume) { "Resume" }
+    if ($Status) { "Status" }
+    if ($ExportReport) { "ExportReport" }
+    if ($PurgeReports) { "PurgeReports" }
+    if ($ResetFailed) { "ResetFailed" }
+)
+
+if ($requestedActions.Count -gt 1) {
+    throw "Une seule action peut etre executee a la fois. Actions recues: $($requestedActions -join ', ')."
+}
+
+if ($IncludeDeleted -and -not ($DeltaInventory -or $CheckChanges)) {
+    throw "-IncludeDeleted est uniquement valable avec -DeltaInventory ou -CheckChanges."
+}
+
+if ($DeleteRemoteMissing -and -not ($Migrate -or $Resume)) {
+    throw "-DeleteRemoteMissing est uniquement valable avec -Migrate ou -Resume."
+}
+
+if ($NewProject -and -not [string]::IsNullOrWhiteSpace($Project)) {
+    throw "-NewProject ne peut pas etre combine avec -Project."
+}
+
 if ($NewProject) {
     if ([string]::IsNullOrWhiteSpace($ProjectName)) {
         throw "Le parametre -ProjectName est obligatoire avec -NewProject."
@@ -52,6 +81,10 @@ $projectInfo = $null
 if (-not [string]::IsNullOrWhiteSpace($Project)) {
     $projectInfo = Get-MigrationProject -Project $Project
     $ConfigPath = $projectInfo.ConfigPath
+}
+
+if ($projectInfo -and $requestedActions.Count -eq 0) {
+    throw "Aucune action projet demandee. Utilise -Inventory, -DeltaInventory, -CheckChanges, -Migrate, -Resume, -Status ou -ExportReport."
 }
 
 $projectOnlyActionRequested = $DeltaInventory -or $CheckChanges -or $Migrate -or $Resume -or $Status -or $ExportReport -or $PurgeReports -or $ResetFailed
@@ -76,6 +109,9 @@ $requiresProjectLock = $projectInfo -and (
     $CheckChanges -or
     $Migrate -or
     $Resume -or
+    $Status -or
+    $ExportReport -or
+    $PurgeReports -or
     $ResetFailed)
 
 if ($requiresProjectLock) {
@@ -83,6 +119,10 @@ if ($requiresProjectLock) {
 }
 
 try {
+
+if ($projectInfo) {
+    Initialize-MigrationDatabase -DatabasePath $projectInfo.DatabasePath
+}
 
 if ($projectInfo -and $Status) {
     Write-ProjectStatus -ProjectInfo $projectInfo
@@ -131,6 +171,7 @@ Write-Log -Level "INFO" -Message "Mode controle changements: $CheckChanges"
 Write-Log -Level "INFO" -Message "Inclure les fichiers supprimes: $IncludeDeleted"
 $effectiveParallelUploads = if ($ParallelUploads -gt 0) { $ParallelUploads } else { $context.ParallelUploads }
 $effectiveAssumeDestinationEmpty = $AssumeDestinationEmpty -or $context.AssumeDestinationEmpty
+Write-Log -Level "INFO" -Message "Inventaire parallele: $($context.ParallelInventory)"
 Write-Log -Level "INFO" -Message "Uploads paralleles: $effectiveParallelUploads"
 Write-Log -Level "INFO" -Message "Destination supposee vide: $effectiveAssumeDestinationEmpty"
 if ($projectInfo) {
@@ -149,7 +190,11 @@ if ($projectInfo -and $CheckChanges) {
 
 $needsSharePointRead = (-not $CheckChanges) -and ((-not $WhatIf) -or $Inventory -or $DeltaInventory)
 Connect-MigrationSharePoint -Context $context -SkipConnection:(-not $needsSharePointRead)
-$blockedExtensions = Get-BlockedExtensionsForMigration -SkipConnection:(-not $needsSharePointRead)
+$blockedExtensions = @()
+$needsInventoryExtensionPolicy = $Inventory -or $DeltaInventory -or (-not $projectInfo)
+if ($needsInventoryExtensionPolicy) {
+    $blockedExtensions = @(Get-InventoryBlockedExtensions -Context $context -SkipConnection:(-not $needsSharePointRead))
+}
 Assert-SharePointDestination -Context $context -SkipValidation:(-not $needsSharePointRead)
 
 if ($projectInfo) {
@@ -179,8 +224,6 @@ if ($projectInfo) {
         return
     }
 
-    Write-Log -Level "WARN" -Message "Aucune action projet demandee. Utilise -Inventory, -DeltaInventory, -Migrate, -Resume, -Status ou -ExportReport."
-    return
 }
 
 Invoke-LegacyMigration -Context $context -WhatIf:$WhatIf -Overwrite:$Overwrite -Inventory:$Inventory -BlockedExtensions $blockedExtensions

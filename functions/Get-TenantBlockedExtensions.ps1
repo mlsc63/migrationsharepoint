@@ -3,29 +3,6 @@ function Get-TenantBlockedExtensions {
         [switch]$IncludeDot
     )
 
-    $syncClientRestriction = Get-PnPTenantSyncClientRestriction -ErrorAction Stop
-    $extensions = $syncClientRestriction.ExcludedFileExtensions
-
-    if ($null -eq $extensions) {
-        return @()
-    }
-
-    $blockedExtensions = @($extensions) |
-        ForEach-Object {
-            "$_" -split ";"
-        } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object {
-            $extension = $_.Trim().TrimStart(".").ToLowerInvariant()
-
-            if ($IncludeDot) {
-                ".$extension"
-            }
-            else {
-                $extension
-            }
-        } |
-        Sort-Object -Unique
-
-    return $blockedExtensions
+    Write-Warning "Get-TenantBlockedExtensions est obsolete. Utilise Get-TenantSyncExcludedExtensions."
+    return @(Get-TenantSyncExcludedExtensions -IncludeDot:$IncludeDot)
 }

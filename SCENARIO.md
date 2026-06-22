@@ -31,10 +31,12 @@ Exemple de configuration fonctionnelle:
 ```xml
 <Migration>
     <HashMode>SHA256</HashMode>
+    <ParallelInventory>4</ParallelInventory>
     <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
     <MaxTotalErrors>1000</MaxTotalErrors>
     <ParallelUploads>4</ParallelUploads>
     <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+    <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
     <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
@@ -42,11 +44,13 @@ Exemple de configuration fonctionnelle:
 Dans ce scenario:
 
 - `SHA256` permet de detecter les modifications reelles du contenu;
+- `ParallelInventory` calcule plusieurs empreintes simultanement;
 - `MaxAttemptsPerFile` evite de retenter indefiniment le meme fichier;
 - `MaxTotalErrors` arrete la migration si trop d'erreurs apparaissent pendant une execution.
 - `ParallelUploads` execute plusieurs uploads simultanement;
 - `AssumeDestinationEmpty` controle si l'existence distante est verifiee avant chaque upload;
-- `ProcessingBatchSize` limite la memoire utilisee pour lire la base SQLite.
+- `TreatTenantSyncExclusionsAsBlocked` permet, si necessaire, de traiter les exclusions de synchronisation OneDrive comme une politique de migration;
+- `ProcessingBatchSize` controle les lots de hash et les pages SQLite, sans limiter l'enumeration locale complete.
 
 ## Etape 1 - Afficher l'aide
 
@@ -128,20 +132,23 @@ Ce que fait le script:
 - lit le dossier source;
 - applique les exclusions;
 - calcule le hash selon `Migration.HashMode`;
-- recupere les extensions bloquees du tenant SharePoint;
+- lit facultativement les exclusions de synchronisation OneDrive selon la politique XML;
 - inscrit les fichiers dans la table `Files`;
 - positionne les statuts initiaux.
 
 Statuts possibles apres inventaire:
 
 - `Pending`: fichier pret a migrer;
-- `BlockedExtension`: fichier non migrable a cause d'une extension bloquee;
+- `BlockedExtension`: fichier non migrable selon la politique optionnelle d'extensions;
+- `Excluded`: fichier ignore par les motifs d'exclusion;
 - `MissingLocalFile`: fichier connu en base mais absent localement, dans certains cas de relance;
 - `Uploaded` ou `SkippedExists`: statuts conserves si la base contenait deja ces fichiers et que leur hash n'a pas change.
 
 Resultat attendu:
 
 La base contient un etat initial fiable avant upload.
+
+Les empreintes sont preparees avant l'ecriture. La mise a jour de la table `Files` est ensuite appliquee dans une transaction SQLite en mode WAL: une interruption pendant cette phase annule tout le lot.
 
 ## Etape 4 - Controler le statut
 
@@ -178,7 +185,7 @@ Un utilisateur a dans le dossier source un fichier:
 C:\Donnees\Lunii\Archives\ancien-outil.exe
 ```
 
-Si l'extension `.exe` est bloquee par le tenant SharePoint, l'inventaire le classe en:
+Si `.exe` figure dans les exclusions de synchronisation OneDrive et que `TreatTenantSyncExclusionsAsBlocked=true`, l'inventaire le classe en:
 
 ```text
 Status = BlockedExtension
@@ -195,7 +202,7 @@ Pour l'analyser, exporter les rapports:
 Puis ouvrir:
 
 ```text
-projects/Migration-Lunii/reports/migration_report_yyyyMMdd_HHmmss.csv
+projects/Migration-Lunii/reports/migration_blocked_extensions_yyyyMMdd_HHmmss_fff.csv
 ```
 
 Filtrer ensuite:
@@ -243,7 +250,7 @@ Envoyer vers SharePoint les fichiers au statut `Pending`.
 Ce que fait le script:
 
 - lit les fichiers `Pending`;
-- ignore les fichiers ayant atteint `MaxAttemptsPerFile`;
+- ignore les fichiers ayant atteint `MaxAttemptsPerFile`, sauf les `Uploading` qui doivent encore etre reconcilies a distance;
 - cree les dossiers SharePoint manquants;
 - verifie si le fichier existe deja;
 - envoie le fichier si necessaire;
@@ -255,6 +262,8 @@ Statuts possibles apres migration:
 - `SkippedExists`: fichier deja present dans SharePoint et non ecrase;
 - `Failed`: erreur pendant l'upload;
 - `MissingLocalFile`: fichier absent du disque au moment de migrer.
+
+Un run contenant quelques erreurs est cloture en `PartialSuccess`; un run sans erreur est cloture en `Success`.
 
 Arret automatique:
 

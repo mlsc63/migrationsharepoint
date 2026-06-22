@@ -2,7 +2,7 @@
 
 Script PowerShell de migration de fichiers depuis un dossier local vers une bibliotheque SharePoint Online avec `PnP.PowerShell`.
 
-Le script parcourt recursivement un dossier source, cree les dossiers manquants dans SharePoint, envoie les fichiers, journalise les operations et peut generer un inventaire des fichiers non migrables selon les extensions bloquees au niveau du tenant.
+Le script parcourt recursivement un dossier source, cree les dossiers manquants dans SharePoint, envoie les fichiers, journalise les operations et peut appliquer une politique optionnelle basee sur les extensions exclues de la synchronisation OneDrive.
 
 ## Structure
 
@@ -18,6 +18,7 @@ Le script parcourt recursivement un dossier source, cree les dossiers manquants 
 |   |-- Format-FileSize.ps1
 |   |-- Get-RequiredValue.ps1
 |   |-- Get-TenantBlockedExtensions.ps1
+|   |-- Get-TenantSyncExcludedExtensions.ps1
 |   |-- Initialize-Log.ps1
 |   |-- Join-SharePointPath.ps1
 |   |-- MigrationWorkflow.ps1
@@ -31,7 +32,7 @@ Le script parcourt recursivement un dossier source, cree les dossiers manquants 
 
 ## Prerequis
 
-- PowerShell 7 obligatoire pour `-Migrate` et `-Resume` avec les uploads paralleles.
+- PowerShell 7 obligatoire pour les workflows projet `-Inventory`, `-DeltaInventory`, `-CheckChanges`, `-Migrate` et `-Resume`.
 - Module PowerShell `PnP.PowerShell`.
 - Module PowerShell `PSSQLite` pour le mode projet avec base `.db`.
 - Application Azure AD / Entra ID autorisee a acceder au site SharePoint.
@@ -83,10 +84,12 @@ La configuration se fait dans `config.xml`.
 
     <Migration>
         <HashMode>SHA256</HashMode>
+        <ParallelInventory>4</ParallelInventory>
         <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
         <MaxTotalErrors>1000</MaxTotalErrors>
         <ParallelUploads>4</ParallelUploads>
         <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+        <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
         <ProcessingBatchSize>1000</ProcessingBatchSize>
     </Migration>
 
@@ -114,11 +117,13 @@ Champs importants:
 - `Destination.Folder`: dossier cible optionnel dans la bibliotheque.
 - `Logging.LogDirectory`: dossier de sortie des journaux.
 - `Migration.HashMode`: mode de detection des modifications locales. Valeurs autorisees: `SHA256`, `Quick`, `None`.
+- `Migration.ParallelInventory`: nombre d'empreintes de fichiers calculees simultanement pour `-Inventory` et `-DeltaInventory`, entre `1` et `16`. Valeur conseillee: `4`.
 - `Migration.MaxAttemptsPerFile`: nombre maximum de tentatives d'upload par fichier. Mettre `0` pour desactiver la limite.
 - `Migration.MaxTotalErrors`: nombre maximum d'erreurs pendant une execution de migration. Mettre `0` pour desactiver l'arret automatique.
 - `Migration.ParallelUploads`: nombre d'uploads simultanes, entre `1` et `16`. Commencer avec `4`.
 - `Migration.AssumeDestinationEmpty`: si `true`, ne controle pas l'existence distante avant chaque upload.
-- `Migration.ProcessingBatchSize`: nombre de lignes SQLite chargees en memoire par page. Defaut: `1000`.
+- `Migration.TreatTenantSyncExclusionsAsBlocked`: si `true`, traite les extensions exclues de la synchronisation OneDrive comme non migrables. Ces restrictions ne sont pas des interdictions d'upload SharePoint; l'option est desactivee par defaut et exige des droits d'administration tenant pendant l'inventaire.
+- `Migration.ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. Defaut: `1000`.
 - `Exclusions.Files.Pattern`: motifs de fichiers a exclure. Les motifs sont compares au nom du fichier et au chemin relatif.
 - `Exclusions.Folders.Pattern`: motifs de dossiers a exclure. Les motifs sont compares aux segments de dossiers et au chemin relatif du dossier.
 
@@ -231,6 +236,8 @@ Cette commande genere quatre fichiers dans `reports/`:
 - `migration_errors_yyyyMMdd_HHmmss.csv`: fichiers en erreur, uniquement `Failed` et `MissingLocalFile`.
 - `migration_changes_yyyyMMdd_HHmmss.csv`: fichiers dont le hash a change entre deux inventaires.
 
+Chaque `-Inventory` ou `-DeltaInventory` projet genere aussi `migration_blocked_extensions_yyyyMMdd_HHmmss_fff.csv`, y compris lorsque la liste est vide.
+
 Controle apres migration:
 
 ```powershell
@@ -305,14 +312,17 @@ Statuts stockes en base:
 - `Uploading`: tentative commencee, mais resultat final pas encore confirme dans SQLite.
 - `Uploaded`: upload reussi.
 - `Failed`: erreur lors de l'upload.
-- `BlockedExtension`: extension bloquee par le tenant.
+- `BlockedExtension`: extension exclue par la politique de migration active.
+- `Excluded`: fichier ignore par un motif configure dans `Exclusions`.
 - `SkippedExists`: fichier deja present dans SharePoint et non ecrase.
 - `MissingLocalFile`: fichier present dans l'inventaire mais introuvable localement.
 - `DeletedRemote`: fichier supprime de SharePoint avec `-DeleteRemoteMissing`.
 
 Au lancement d'une reprise, les fichiers restes en `Uploading` conservent ce statut. Le script force alors un controle distant, meme avec `AssumeDestinationEmpty=true`, afin de ne pas reenvoyer aveuglement un fichier dont l'upload aurait reussi avant l'interruption.
 
-Un verrou exclusif `migration.lock` empeche deux inventaires ou migrations d'ecrire simultanement dans le meme projet.
+Un verrou exclusif `migration.lock` empeche deux inventaires, migrations ou exports de travailler simultanement sur le meme projet.
+
+Les fichiers d'un inventaire sont prepares avant toute modification de la table `Files`, puis appliques dans une transaction SQLite unique. Une erreur annule donc l'ensemble des changements de cet inventaire.
 
 ## Base de donnees projet
 
@@ -354,6 +364,7 @@ Table centrale de la migration. Une ligne correspond a un fichier local inventor
 - `TargetFolder`: dossier SharePoint cible.
 - `TargetUrl`: URL serveur-relative complete du fichier cible SharePoint.
 - `Status`: etat courant du fichier dans la migration.
+- `StatusBeforeExclusion`: statut conserve lorsqu'un fichier passe temporairement en `Excluded`.
 - `AttemptCount`: nombre de tentatives d'upload.
 - `LastError`: derniere erreur connue pour ce fichier.
 - `LastInventorySeenAt`: date du dernier inventaire ou le fichier a ete revu sur le disque.
@@ -367,7 +378,8 @@ Statuts possibles:
 - `Uploading`: fichier dont la tentative a commence sans resultat final confirme. A la reprise, son existence distante est verifiee avant toute nouvelle tentative.
 - `Uploaded`: fichier envoye avec succes.
 - `Failed`: erreur lors de l'upload.
-- `BlockedExtension`: fichier bloque car son extension est interdite par le tenant.
+- `BlockedExtension`: fichier bloque par la politique optionnelle basee sur les exclusions de synchronisation OneDrive.
+- `Excluded`: fichier ignore par les exclusions de configuration.
 - `SkippedExists`: fichier deja present dans SharePoint et non ecrase.
 - `MissingLocalFile`: fichier present dans l'inventaire mais introuvable sur le disque au moment de la migration.
 - `DeletedRemote`: fichier absent localement et supprime de SharePoint avec `-DeleteRemoteMissing`.
@@ -395,7 +407,7 @@ Trace les executions du projet.
 - `Mode`: type d'execution, par exemple `Inventory`, `Migrate` ou `Resume`.
 - `StartedAt`: date de debut.
 - `FinishedAt`: date de fin, si l'execution s'est terminee proprement.
-- `Result`: resultat de l'execution, par exemple `Running`, `Success` ou `Failed`.
+- `Result`: resultat de l'execution, par exemple `Running`, `Success`, `PartialSuccess`, `Interrupted` ou `Failed`.
 - `Message`: resume ou message d'erreur associe.
 
 Cette table sert surtout a auditer les lancements et a comprendre l'historique d'un projet.
@@ -403,6 +415,8 @@ Cette table sert surtout a auditer les lancements et a comprendre l'historique d
 ## Modes disponibles
 
 Le script contient les options suivantes:
+
+Une seule action principale peut etre demandee par lancement. Par exemple, `-Inventory -Migrate` est refuse au lieu de choisir silencieusement une action.
 
 - `-WhatIf`: simuler les uploads et suppressions pour une migration ou reprise, sans modifier SharePoint.
 - `-Help`: afficher l'aide integree.
@@ -437,7 +451,7 @@ Le script contient les options suivantes:
 5. Construit le chemin SharePoint cible.
 6. Verifie et importe le module `PnP.PowerShell`.
 7. Se connecte a SharePoint avec certificat.
-8. Recupere les extensions bloquees par le tenant.
+8. Lit facultativement les exclusions de synchronisation OneDrive si la politique correspondante est active.
 9. Valide que la bibliotheque ou le dossier SharePoint cible est accessible.
 10. Parcourt tous les fichiers locaux en appliquant les exclusions.
 11. Cree les dossiers distants manquants.
@@ -463,7 +477,7 @@ Sans projet:
 .\main.ps1 -Inventory
 ```
 
-Le script produit un journal dedie listant les fichiers bloques par extension tenant.
+Le script produit un journal dedie listant les fichiers bloques par la politique d'extensions active.
 
 Avec projet:
 
@@ -476,7 +490,7 @@ Le script alimente la base `migration.db`, notamment la table `Files`, avec le c
 Dans les deux cas, quand `Inventory` est actif, le script:
 
 - se connecte a SharePoint;
-- recupere les extensions bloquees;
+- lit les exclusions de synchronisation OneDrive uniquement si la politique XML est active;
 - valide la destination SharePoint;
 - analyse les fichiers locaux;
 - applique les exclusions;
@@ -571,20 +585,24 @@ Les limites de migration sont configurees dans le `config.xml` du projet:
 ```xml
 <Migration>
     <HashMode>SHA256</HashMode>
+    <ParallelInventory>4</ParallelInventory>
     <MaxAttemptsPerFile>3</MaxAttemptsPerFile>
     <MaxTotalErrors>1000</MaxTotalErrors>
     <ParallelUploads>4</ParallelUploads>
     <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
+    <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
     <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
 
 - `HashMode`: `SHA256`, `Quick` ou `None`.
-- `MaxAttemptsPerFile`: un fichier dont `AttemptCount` atteint cette valeur n'est plus repris par `-Migrate` ou `-Resume`.
+- `ParallelInventory`: nombre de calculs d'empreinte simultanes pendant l'inventaire complet et le delta.
+- `MaxAttemptsPerFile`: un fichier dont `AttemptCount` atteint cette valeur n'est plus rejoue. Un fichier `Uploading` reste toutefois controle a distance une derniere fois pour reconcilier un upload incertain.
 - `MaxTotalErrors`: si ce nombre d'erreurs est atteint pendant une execution, la migration s'arrete.
 - `ParallelUploads`: nombre d'uploads executes simultanement. Augmenter progressivement pour surveiller le throttling SharePoint.
 - `AssumeDestinationEmpty`: supprime un appel distant par fichier, mais peut ecraser un fichier SharePoint non reference dans SQLite.
-- `ProcessingBatchSize`: limite la quantite de lignes SQLite chargees et groupees en memoire. `1000` convient a la plupart des migrations.
+- `TreatTenantSyncExclusionsAsBlocked`: transforme explicitement les exclusions de synchronisation OneDrive en blocages de migration. Cette option ne decrit pas les restrictions natives d'upload SharePoint.
+- `ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. L'enumeration locale complete reste chargee en memoire. `1000` convient a la plupart des migrations.
 
 Dans un projet existant, modifier le fichier:
 

@@ -751,10 +751,6 @@ function Upsert-MigrationFile {
 
     if ($null -ne $Writer) {
         $existingFile = Get-MigrationFileWriterExistingRow -Writer $Writer -FullPath $File.FullName
-        $existingRows = @()
-        if ($null -ne $existingFile) {
-            $existingRows = @($existingFile)
-        }
     }
     else {
         $selectParameters = @{
@@ -769,12 +765,11 @@ function Upsert-MigrationFile {
             $selectParameters.DataSource = $DatabasePath
         }
 
-        $existingRows = @(Invoke-SqliteQuery @selectParameters)
+        $existingFile = Invoke-SqliteQuery @selectParameters | Select-Object -First 1
     }
 
-    if ($existingRows.Count -gt 0) {
+    if ($null -ne $existingFile) {
         $isNew = $false
-        $existingFile = $existingRows[0]
         $existingStatus = "$($existingFile.Status)"
         $restoredStatus = if ($existingStatus -eq "Excluded") {
             if (-not [string]::IsNullOrWhiteSpace("$($existingFile.StatusBeforeExclusion)")) {

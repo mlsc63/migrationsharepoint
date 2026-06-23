@@ -4,6 +4,7 @@ Ce document simule une migration SharePoint complete avec le mode projet.
 Il explique les commandes a executer, leur objectif fonctionnel et le resultat attendu a chaque etape.
 
 Le scenario utilise le projet d'exemple `Migration-Lunii`.
+Pour le detail des parametres, des statuts et de la structure SQLite, voir `README.md`.
 
 ## Objectif du scenario
 
@@ -247,6 +248,16 @@ Objectif:
 
 Envoyer vers SharePoint les fichiers au statut `Pending`.
 
+Option prudente pour un premier lot:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate -MaxFiles 20
+.\main.ps1 -Project "Migration-Lunii" -Status
+.\main.ps1 -Project "Migration-Lunii" -Migrate
+```
+
+Cette approche valide la connexion, la creation des dossiers, les logs et les statuts sur un petit nombre de fichiers avant de traiter tout le stock.
+
 Ce que fait le script:
 
 - lit les fichiers `Pending`;
@@ -292,6 +303,16 @@ Ce que fait le script:
 Resultat attendu:
 
 La migration continue la ou elle s'etait arretee.
+
+Pour reprendre par paliers:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Resume -MaxFiles 100
+.\main.ps1 -Project "Migration-Lunii" -Status
+.\main.ps1 -Project "Migration-Lunii" -Resume -MaxFiles 1000
+```
+
+Quand les erreurs sont comprises et que le debit est stable, lancer ensuite `-Resume` sans `-MaxFiles`.
 
 ## Etape 7 - Exporter les rapports
 
@@ -564,6 +585,7 @@ Pour une migration standard:
 .\main.ps1 -NewProject -ProjectName "Migration-Lunii" -ConfigPath .\config.xml
 .\main.ps1 -Project "Migration-Lunii" -Inventory
 .\main.ps1 -Project "Migration-Lunii" -Status
+.\main.ps1 -Project "Migration-Lunii" -Migrate -MaxFiles 20
 .\main.ps1 -Project "Migration-Lunii" -Migrate
 .\main.ps1 -Project "Migration-Lunii" -Resume
 .\main.ps1 -Project "Migration-Lunii" -ExportReport
@@ -592,6 +614,17 @@ Pour une migration standard:
 | `-DeleteRemoteMissing` | Supprimer dans SharePoint les fichiers marques `MissingLocalFile`. |
 | `-ResetFailed` | Remettre les erreurs en attente pour les rejouer. |
 | `-PurgeReports` | Nettoyer les anciens rapports. |
+
+## Depannage rapide pendant le scenario
+
+| Symptome | Action |
+| --- | --- |
+| Certificat introuvable | Verifier le thumbprint et le magasin certificat de la session qui execute PowerShell. |
+| Beaucoup de `BlockedExtension` | Exporter les rapports et verifier `migration_blocked_extensions_*.csv`. |
+| Delta silencieux apres la preparation | Verifier les lignes `Application delta SQLite`; elles indiquent l'ecriture transactionnelle en base. |
+| Trop d'erreurs d'upload | Exporter les erreurs, corriger la cause, puis lancer `-ResetFailed` et `-Resume`. |
+| Migration trop longue | Tester `-MaxFiles`, ajuster `ParallelUploads`, et surveiller les logs SharePoint. |
+| Fichiers supprimes localement encore presents dans SharePoint | Lancer `-DeltaInventory -IncludeDeleted`, puis `-Migrate -DeleteRemoteMissing`. |
 
 ## Regle de decision finale
 

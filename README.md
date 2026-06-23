@@ -4,6 +4,8 @@ Script PowerShell de migration de fichiers depuis un dossier local vers une bibl
 
 Le script parcourt recursivement un dossier source, cree les dossiers manquants dans SharePoint, envoie les fichiers, journalise les operations et peut appliquer une politique optionnelle basee sur les extensions exclues de la synchronisation OneDrive.
 
+Ce fichier sert de reference technique. Pour un deroule operationnel pas a pas, voir `SCENARIO.md`.
+
 ## Structure
 
 ```text
@@ -144,6 +146,56 @@ Lancement standard sans projet:
 Les journaux sont crees dans le dossier configure, par defaut `.\logs`.
 
 Pour une migration repriseable, utiliser le workflow projet decrit ci-dessous.
+
+## Commandes essentielles
+
+Workflow recommande:
+
+```powershell
+.\main.ps1 -NewProject -ProjectName "Migration-Lunii" -ConfigPath .\config.xml
+.\main.ps1 -Project "Migration-Lunii" -Inventory
+.\main.ps1 -Project "Migration-Lunii" -Status
+.\main.ps1 -Project "Migration-Lunii" -Migrate
+.\main.ps1 -Project "Migration-Lunii" -Resume
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory
+.\main.ps1 -Project "Migration-Lunii" -ExportReport
+```
+
+Lancements prudents sur gros volumes:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Migrate -MaxFiles 20
+.\main.ps1 -Project "Migration-Lunii" -Resume -MaxFiles 20
+.\main.ps1 -Project "Migration-Lunii" -Resume -MaxFiles 1000
+.\main.ps1 -Project "Migration-Lunii" -Resume
+```
+
+Controle et maintenance:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -CheckChanges
+.\main.ps1 -Project "Migration-Lunii" -DeltaInventory -IncludeDeleted
+.\main.ps1 -Project "Migration-Lunii" -Migrate -DeleteRemoteMissing
+.\main.ps1 -Project "Migration-Lunii" -ResetFailed
+.\main.ps1 -Project "Migration-Lunii" -PurgeReports -ReportRetentionDays 30
+```
+
+## Choisir la bonne commande
+
+| Besoin | Commande |
+| --- | --- |
+| Creer un projet repriseable | `-NewProject -ProjectName "<nom>" -ConfigPath .\config.xml` |
+| Construire l'inventaire initial | `-Project "<nom>" -Inventory` |
+| Voir l'etat courant | `-Project "<nom>" -Status` |
+| Migrer les fichiers en attente | `-Project "<nom>" -Migrate` |
+| Reprendre apres erreur ou interruption | `-Project "<nom>" -Resume` |
+| Tester une migration ou reprise sur un petit lot | `-Project "<nom>" -Migrate -MaxFiles 20` ou `-Resume -MaxFiles 20` |
+| Voir les changements sans modifier la base | `-Project "<nom>" -CheckChanges` |
+| Integrer les ajouts/modifications locaux | `-Project "<nom>" -DeltaInventory` |
+| Integrer les suppressions locales | `-Project "<nom>" -DeltaInventory -IncludeDeleted` |
+| Supprimer dans SharePoint les fichiers disparus localement | `-Project "<nom>" -Migrate -DeleteRemoteMissing` |
+| Exporter les CSV | `-Project "<nom>" -ExportReport` |
+| Rejouer les fichiers en erreur | `-Project "<nom>" -ResetFailed`, puis `-Migrate` ou `-Resume` |
 
 ## Workflow projet avec reprise
 
@@ -636,6 +688,67 @@ Exemples de statuts:
 - `[WARN]`: avertissement ou fichier ignore.
 - `[SUCCESS]`: upload reussi.
 - `[ERROR]`: erreur bloquante ou erreur fichier.
+
+## Depannage
+
+### Certificat introuvable
+
+Erreur typique:
+
+```text
+Cannot find certificate with this thumbprint in the certificate store.
+```
+
+Points a verifier:
+
+- le thumbprint dans `projects/<NomProjet>/config.xml`;
+- la presence du certificat dans le magasin Windows de l'utilisateur ou de la machine qui execute le script;
+- l'execution depuis une session PowerShell ayant acces a ce magasin;
+- les droits de l'application Entra ID associee au certificat.
+
+### Extensions bloquees
+
+`TreatTenantSyncExclusionsAsBlocked=true` lit les extensions exclues de la synchronisation OneDrive au niveau tenant et les traite comme une politique de migration.
+
+Important: ces exclusions ne sont pas forcement des interdictions natives d'upload SharePoint. Si des fichiers passent en `BlockedExtension`, verifier le rapport:
+
+```text
+projects/<NomProjet>/reports/migration_blocked_extensions_yyyyMMdd_HHmmss_fff.csv
+```
+
+### Migration ou delta lent
+
+Pour l'inventaire:
+
+- `HashMode=SHA256` lit tout le contenu des fichiers et peut etre long;
+- `HashMode=Quick` utilise taille + date de modification UTC et convient mieux aux gros tests;
+- `ParallelInventory` augmente le nombre de calculs d'empreinte simultanes.
+
+Pour l'application SQLite:
+
+- la progression apparait sous la forme `Application delta SQLite: n/total`;
+- `ProcessingBatchSize` controle la frequence de progression et la taille des lots;
+- la transaction SQLite reste atomique: si elle echoue, le lot est annule.
+
+Pour l'upload:
+
+- `ParallelUploads` augmente le nombre d'uploads simultanes;
+- augmenter progressivement pour surveiller le throttling SharePoint;
+- utiliser `-MaxFiles` pour valider un lot avant une reprise complete.
+
+### Reprise apres crash
+
+Relancer:
+
+```powershell
+.\main.ps1 -Project "<NomProjet>" -Resume
+```
+
+Les fichiers restes en `Uploading` sont toujours reconciles a distance avant toute nouvelle tentative, meme si `AssumeDestinationEmpty=true`.
+
+### Destination supposee vide
+
+`AssumeDestinationEmpty=true` evite un controle distant par fichier et accelere la migration, mais le script ne verifie plus chaque cible avant upload. A utiliser uniquement si la bibliotheque cible ne contient pas de fichiers externes au projet.
 
 ## Precautions
 

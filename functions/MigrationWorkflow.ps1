@@ -1053,7 +1053,7 @@ function Invoke-ParallelMigrationUploads {
 
             $exception = $ErrorRecord.Exception
             while ($null -ne $exception) {
-                if ($exception.Message -match "(?i)(nullable object must have a value|timeout|temporar|throttl|429|502|503|connection|conflict|already exists|existe deja)") {
+                if ($exception.Message -match "(?i)(nullable object must have a value|object reference not set|timeout|temporar|throttl|429|502|503|connection|conflict|already exists|existe deja)") {
                     return $true
                 }
 
@@ -1061,6 +1061,43 @@ function Invoke-ParallelMigrationUploads {
             }
 
             return $false
+        }
+
+        function Connect-PnPOnlineWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Url,
+
+                [Parameter(Mandatory)]
+                [string]$Tenant,
+
+                [Parameter(Mandatory)]
+                [string]$ClientId,
+
+                [Parameter(Mandatory)]
+                [string]$Thumbprint,
+
+                [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                try {
+                    return Connect-PnPOnline `
+                        -Url $Url `
+                        -Tenant $Tenant `
+                        -ClientId $ClientId `
+                        -Thumbprint $Thumbprint `
+                        -ReturnConnection `
+                        -ErrorAction Stop
+                }
+                catch {
+                    if ($attempt -ge $MaxAttempts -or -not (Test-PnPTransientFolderError -ErrorRecord $_)) {
+                        throw
+                    }
+
+                    Start-Sleep -Milliseconds (500 * $attempt)
+                }
+            }
         }
 
         function Get-PnPFolderWithRetry {
@@ -1133,13 +1170,11 @@ function Invoke-ParallelMigrationUploads {
             if ($null -eq $connectionVariable -or $null -eq $connectionVariable.Value) {
                 Import-Module PnP.PowerShell -ErrorAction Stop
                 Import-Module PSSQLite -ErrorAction Stop
-                $script:MigrationPnPConnection = Connect-PnPOnline `
+                $script:MigrationPnPConnection = Connect-PnPOnlineWithRetry `
                     -Url $using:siteUrl `
                     -Tenant $using:tenantId `
                     -ClientId $using:clientId `
-                    -Thumbprint $using:certificateThumbprint `
-                    -ReturnConnection `
-                    -ErrorAction Stop
+                    -Thumbprint $using:certificateThumbprint
             }
 
             $connection = $script:MigrationPnPConnection
@@ -1356,7 +1391,7 @@ function Start-MigrationUploadWorker {
 
             $exception = $ErrorRecord.Exception
             while ($null -ne $exception) {
-                if ($exception.Message -match "(?i)(nullable object must have a value|timeout|temporar|throttl|429|502|503|connection|conflict|already exists|existe deja)") {
+                if ($exception.Message -match "(?i)(nullable object must have a value|object reference not set|timeout|temporar|throttl|429|502|503|connection|conflict|already exists|existe deja)") {
                     return $true
                 }
 
@@ -1364,6 +1399,43 @@ function Start-MigrationUploadWorker {
             }
 
             return $false
+        }
+
+        function Connect-PnPOnlineWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Url,
+
+                [Parameter(Mandatory)]
+                [string]$Tenant,
+
+                [Parameter(Mandatory)]
+                [string]$ClientId,
+
+                [Parameter(Mandatory)]
+                [string]$Thumbprint,
+
+                [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                try {
+                    return Connect-PnPOnline `
+                        -Url $Url `
+                        -Tenant $Tenant `
+                        -ClientId $ClientId `
+                        -Thumbprint $Thumbprint `
+                        -ReturnConnection `
+                        -ErrorAction Stop
+                }
+                catch {
+                    if ($attempt -ge $MaxAttempts -or -not (Test-PnPTransientFolderError -ErrorRecord $_)) {
+                        throw
+                    }
+
+                    Start-Sleep -Milliseconds (500 * $attempt)
+                }
+            }
         }
 
         function Get-PnPFolderWithRetry {
@@ -1448,13 +1520,11 @@ function Start-MigrationUploadWorker {
                 if ($null -eq $connection) {
                     Import-Module PnP.PowerShell -ErrorAction Stop
                     Import-Module PSSQLite -ErrorAction Stop
-                    $connection = Connect-PnPOnline `
+                    $connection = Connect-PnPOnlineWithRetry `
                         -Url $siteUrl `
                         -Tenant $tenantId `
                         -ClientId $clientId `
-                        -Thumbprint $certificateThumbprint `
-                        -ReturnConnection `
-                        -ErrorAction Stop
+                        -Thumbprint $certificateThumbprint
                 }
 
                 $operation = "Creation/verification du dossier SharePoint"

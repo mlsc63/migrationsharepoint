@@ -148,7 +148,7 @@ Resultat attendu:
 
 La base contient un etat initial fiable avant upload.
 
-Les empreintes sont preparees avant l'ecriture. La mise a jour de la table `Files` est ensuite appliquee dans une transaction SQLite en mode WAL: une interruption pendant cette phase annule tout le lot.
+Les empreintes sont preparees avant l'ecriture. La mise a jour de la table `Files` est ensuite appliquee dans une transaction SQLite en mode WAL avec commandes preparees et logs de progression: une interruption pendant cette phase annule tout le lot.
 
 ## Etape 4 - Controler le statut
 

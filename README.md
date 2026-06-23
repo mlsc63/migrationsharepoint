@@ -328,7 +328,7 @@ Au lancement d'une reprise, les fichiers restes en `Uploading` conservent ce sta
 
 Un verrou exclusif `migration.lock` empeche deux inventaires, migrations ou exports de travailler simultanement sur le meme projet.
 
-Les fichiers d'un inventaire sont prepares avant toute modification de la table `Files`, puis appliques dans une transaction SQLite unique. Une erreur annule donc l'ensemble des changements de cet inventaire.
+Les fichiers d'un inventaire sont prepares avant toute modification de la table `Files`, puis appliques dans une transaction SQLite unique. Une erreur annule donc l'ensemble des changements de cet inventaire. L'application en base reutilise des commandes SQLite preparees et journalise la progression par lots `ProcessingBatchSize`.
 
 ## Base de donnees projet
 

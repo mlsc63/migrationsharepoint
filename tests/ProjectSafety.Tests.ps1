@@ -56,6 +56,69 @@ Describe "Project safety" {
         $storedHash | Should Be "SHA256:PREPARED"
     }
 
+    It "uses the prepared SQLite writer for upserts and exclusions" {
+        $databasePath = Join-Path $TestDrive "prepared-writer.db"
+        $activePath = Join-Path $TestDrive "active.txt"
+        $excludedPath = Join-Path $TestDrive "ignored.tmp"
+        Set-Content -LiteralPath $activePath -Value "active-one" -NoNewline
+        Set-Content -LiteralPath $excludedPath -Value "ignored" -NoNewline
+        Initialize-MigrationDatabase -DatabasePath $databasePath
+
+        Invoke-MigrationDatabaseTransaction -DatabasePath $databasePath -Action {
+            param($connection)
+
+            $writer = New-MigrationFileWriter -SQLiteConnection $connection
+            try {
+                $null = Upsert-MigrationFile `
+                    -DatabasePath $databasePath `
+                    -File (Get-Item -LiteralPath $activePath) `
+                    -SourceRoot $TestDrive `
+                    -ServerRelativeRoot "/sites/Test/Docs" `
+                    -InventorySeenAt "run1" `
+                    -HashMode SHA256 `
+                    -FileHash "SHA256:ONE" `
+                    -FingerprintProvided `
+                    -SQLiteConnection $connection `
+                    -Writer $writer
+
+                Invoke-SqliteQuery -SQLiteConnection $connection -Query "UPDATE Files SET Status='Failed', AttemptCount=2 WHERE RelativePath='active.txt';" | Out-Null
+
+                $null = Upsert-MigrationFile `
+                    -DatabasePath $databasePath `
+                    -File (Get-Item -LiteralPath $activePath) `
+                    -SourceRoot $TestDrive `
+                    -ServerRelativeRoot "/sites/Test/Docs" `
+                    -InventorySeenAt "run2" `
+                    -HashMode SHA256 `
+                    -FileHash "SHA256:TWO" `
+                    -FingerprintProvided `
+                    -SQLiteConnection $connection `
+                    -Writer $writer
+
+                Set-MigrationFileExcluded `
+                    -DatabasePath $databasePath `
+                    -File (Get-Item -LiteralPath $excludedPath) `
+                    -SourceRoot $TestDrive `
+                    -ServerRelativeRoot "/sites/Test/Docs" `
+                    -InventorySeenAt "run2" `
+                    -SQLiteConnection $connection `
+                    -Writer $writer
+            }
+            finally {
+                Close-MigrationFileWriter -Writer $writer
+            }
+        }
+
+        $rows = @(Invoke-SqliteQuery -DataSource $databasePath -Query "SELECT RelativePath, Status, AttemptCount, HashChanged FROM Files ORDER BY RelativePath;" -As PSObject)
+        $active = @($rows | Where-Object RelativePath -eq "active.txt")[0]
+        $excluded = @($rows | Where-Object RelativePath -eq "ignored.tmp")[0]
+
+        $active.Status | Should Be "Pending"
+        $active.AttemptCount | Should Be 0
+        $active.HashChanged | Should Be 1
+        $excluded.Status | Should Be "Excluded"
+    }
+
     It "prevents two exclusive executions on the same project" {
         $databasePath = Join-Path $TestDrive "migration.db"
         New-Item -ItemType File -Path $databasePath | Out-Null

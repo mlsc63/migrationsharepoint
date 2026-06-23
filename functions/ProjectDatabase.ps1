@@ -435,6 +435,255 @@ function Get-MigrationFileFingerprint {
     }
 }
 
+function New-MigrationPreparedCommand {
+    param(
+        [Parameter(Mandatory)]
+        [object]$SQLiteConnection,
+
+        [Parameter(Mandatory)]
+        [string]$CommandText,
+
+        [string[]]$ParameterNames = @()
+    )
+
+    $command = $SQLiteConnection.CreateCommand()
+    $command.CommandText = $CommandText
+
+    foreach ($parameterName in $ParameterNames) {
+        $parameter = $command.CreateParameter()
+        $parameter.ParameterName = if ($parameterName.StartsWith("@")) { $parameterName } else { "@$parameterName" }
+        $null = $command.Parameters.Add($parameter)
+    }
+
+    $command.Prepare()
+    return $command
+}
+
+function Set-MigrationCommandParameter {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Command,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [AllowNull()]
+        [object]$Value
+    )
+
+    $parameterName = if ($Name.StartsWith("@")) { $Name } else { "@$Name" }
+    $Command.Parameters[$parameterName].Value = if ($null -eq $Value) { [DBNull]::Value } else { $Value }
+}
+
+function Get-MigrationDataReaderValue {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Reader,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $ordinal = $Reader.GetOrdinal($Name)
+    if ($Reader.IsDBNull($ordinal)) {
+        return $null
+    }
+
+    return $Reader.GetValue($ordinal)
+}
+
+function New-MigrationFileWriter {
+    param(
+        [Parameter(Mandatory)]
+        [object]$SQLiteConnection
+    )
+
+    $fileParameterNames = @(
+        "FullPath",
+        "RelativePath",
+        "Extension",
+        "FileHash",
+        "PreviousFileHash",
+        "HashChanged",
+        "LastHashChangedAt",
+        "SizeBytes",
+        "LastWriteTimeUtc",
+        "TargetFolder",
+        "TargetUrl",
+        "Status",
+        "AttemptCount",
+        "LastError",
+        "LastInventorySeenAt",
+        "CreatedAt",
+        "UpdatedAt",
+        "UploadedAt"
+    )
+
+    $excludedParameterNames = @(
+        "FullPath",
+        "RelativePath",
+        "Extension",
+        "SizeBytes",
+        "LastWriteTimeUtc",
+        "TargetFolder",
+        "TargetUrl",
+        "LastInventorySeenAt",
+        "CreatedAt",
+        "UpdatedAt"
+    )
+
+    return [pscustomobject]@{
+        SelectCommand = New-MigrationPreparedCommand `
+            -SQLiteConnection $SQLiteConnection `
+            -CommandText "SELECT Status, StatusBeforeExclusion, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, LastError, AttemptCount, UploadedAt FROM Files WHERE FullPath = @FullPath LIMIT 1;" `
+            -ParameterNames @("FullPath")
+        UpsertCommand = New-MigrationPreparedCommand `
+            -SQLiteConnection $SQLiteConnection `
+            -CommandText @"
+INSERT INTO Files (
+    FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, SizeBytes, LastWriteTimeUtc,
+    TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
+    CreatedAt, UpdatedAt, UploadedAt
+)
+VALUES (
+    @FullPath, @RelativePath, @Extension, @FileHash, @PreviousFileHash, @HashChanged, @LastHashChangedAt, @SizeBytes, @LastWriteTimeUtc,
+    @TargetFolder, @TargetUrl, @Status, NULL, @AttemptCount, @LastError, @LastInventorySeenAt,
+    @CreatedAt, @UpdatedAt, @UploadedAt
+)
+ON CONFLICT(FullPath) DO UPDATE SET
+    RelativePath = excluded.RelativePath,
+    Extension = excluded.Extension,
+    FileHash = excluded.FileHash,
+    PreviousFileHash = excluded.PreviousFileHash,
+    HashChanged = excluded.HashChanged,
+    LastHashChangedAt = excluded.LastHashChangedAt,
+    SizeBytes = excluded.SizeBytes,
+    LastWriteTimeUtc = excluded.LastWriteTimeUtc,
+    TargetFolder = excluded.TargetFolder,
+    TargetUrl = excluded.TargetUrl,
+    Status = excluded.Status,
+    StatusBeforeExclusion = NULL,
+    AttemptCount = excluded.AttemptCount,
+    LastError = excluded.LastError,
+    LastInventorySeenAt = excluded.LastInventorySeenAt,
+    UpdatedAt = excluded.UpdatedAt,
+    UploadedAt = excluded.UploadedAt;
+"@ `
+            -ParameterNames $fileParameterNames
+        ExcludedCommand = New-MigrationPreparedCommand `
+            -SQLiteConnection $SQLiteConnection `
+            -CommandText @"
+INSERT INTO Files (
+    FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, SizeBytes, LastWriteTimeUtc,
+    TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
+    CreatedAt, UpdatedAt, UploadedAt
+)
+VALUES (
+    @FullPath, @RelativePath, @Extension, '', '', 0, @SizeBytes, @LastWriteTimeUtc,
+    @TargetFolder, @TargetUrl, 'Excluded', NULL, 0, 'Exclu par la configuration', @LastInventorySeenAt,
+    @CreatedAt, @UpdatedAt, NULL
+)
+ON CONFLICT(FullPath) DO UPDATE SET
+    RelativePath = excluded.RelativePath,
+    Extension = excluded.Extension,
+    SizeBytes = excluded.SizeBytes,
+    LastWriteTimeUtc = excluded.LastWriteTimeUtc,
+    TargetFolder = excluded.TargetFolder,
+    TargetUrl = excluded.TargetUrl,
+    StatusBeforeExclusion = CASE WHEN Files.Status = 'Excluded' THEN Files.StatusBeforeExclusion ELSE Files.Status END,
+    Status = 'Excluded',
+    LastError = 'Exclu par la configuration',
+    LastInventorySeenAt = excluded.LastInventorySeenAt,
+    UpdatedAt = excluded.UpdatedAt;
+"@ `
+            -ParameterNames $excludedParameterNames
+    }
+}
+
+function Close-MigrationFileWriter {
+    param(
+        [AllowNull()]
+        [object]$Writer
+    )
+
+    if ($null -eq $Writer) {
+        return
+    }
+
+    foreach ($commandName in @("SelectCommand", "UpsertCommand", "ExcludedCommand")) {
+        $command = $Writer.$commandName
+        if ($null -ne $command) {
+            $command.Dispose()
+        }
+    }
+}
+
+function Get-MigrationFileWriterExistingRow {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Writer,
+
+        [Parameter(Mandatory)]
+        [string]$FullPath
+    )
+
+    Set-MigrationCommandParameter -Command $Writer.SelectCommand -Name "FullPath" -Value $FullPath
+    $reader = $Writer.SelectCommand.ExecuteReader()
+
+    try {
+        if (-not $reader.Read()) {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            Status                = Get-MigrationDataReaderValue -Reader $reader -Name "Status"
+            StatusBeforeExclusion = Get-MigrationDataReaderValue -Reader $reader -Name "StatusBeforeExclusion"
+            FileHash              = Get-MigrationDataReaderValue -Reader $reader -Name "FileHash"
+            PreviousFileHash      = Get-MigrationDataReaderValue -Reader $reader -Name "PreviousFileHash"
+            HashChanged           = Get-MigrationDataReaderValue -Reader $reader -Name "HashChanged"
+            LastHashChangedAt     = Get-MigrationDataReaderValue -Reader $reader -Name "LastHashChangedAt"
+            LastError             = Get-MigrationDataReaderValue -Reader $reader -Name "LastError"
+            AttemptCount          = Get-MigrationDataReaderValue -Reader $reader -Name "AttemptCount"
+            UploadedAt            = Get-MigrationDataReaderValue -Reader $reader -Name "UploadedAt"
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
+function Invoke-MigrationFileWriterUpsert {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Writer,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Values
+    )
+
+    foreach ($key in $Values.Keys) {
+        Set-MigrationCommandParameter -Command $Writer.UpsertCommand -Name $key -Value $Values[$key]
+    }
+
+    $null = $Writer.UpsertCommand.ExecuteNonQuery()
+}
+
+function Invoke-MigrationFileWriterExcluded {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Writer,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Values
+    )
+
+    foreach ($key in $Values.Keys) {
+        Set-MigrationCommandParameter -Command $Writer.ExcludedCommand -Name $key -Value $Values[$key]
+    }
+
+    $null = $Writer.ExcludedCommand.ExecuteNonQuery()
+}
+
 function Upsert-MigrationFile {
     param(
         [Parameter(Mandatory)]
@@ -461,7 +710,9 @@ function Upsert-MigrationFile {
 
         [switch]$FingerprintProvided,
 
-        [object]$SQLiteConnection
+        [object]$SQLiteConnection,
+
+        [object]$Writer
     )
 
     $relativePath = Convert-ToSharePointRelativePath -BasePath $SourceRoot -FilePath $File.FullName
@@ -498,19 +749,25 @@ function Upsert-MigrationFile {
         $lastError = "Extension exclue par la politique de migration: .$extension"
     }
 
-    $selectParameters = @{
-        Query         = "SELECT Status, StatusBeforeExclusion, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, LastError, AttemptCount, UploadedAt FROM Files WHERE FullPath = @FullPath LIMIT 1;"
-        SqlParameters = @{ FullPath = $File.FullName }
-        As            = "PSObject"
-    }
-    if ($null -ne $SQLiteConnection) {
-        $selectParameters.SQLiteConnection = $SQLiteConnection
+    if ($null -ne $Writer) {
+        $existingFile = Get-MigrationFileWriterExistingRow -Writer $Writer -FullPath $File.FullName
+        $existingRows = if ($null -ne $existingFile) { @($existingFile) } else { @() }
     }
     else {
-        $selectParameters.DataSource = $DatabasePath
-    }
+        $selectParameters = @{
+            Query         = "SELECT Status, StatusBeforeExclusion, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, LastError, AttemptCount, UploadedAt FROM Files WHERE FullPath = @FullPath LIMIT 1;"
+            SqlParameters = @{ FullPath = $File.FullName }
+            As            = "PSObject"
+        }
+        if ($null -ne $SQLiteConnection) {
+            $selectParameters.SQLiteConnection = $SQLiteConnection
+        }
+        else {
+            $selectParameters.DataSource = $DatabasePath
+        }
 
-    $existingRows = @(Invoke-SqliteQuery @selectParameters)
+        $existingRows = @(Invoke-SqliteQuery @selectParameters)
+    }
 
     if ($existingRows.Count -gt 0) {
         $isNew = $false
@@ -574,8 +831,33 @@ function Upsert-MigrationFile {
     $now = (Get-Date).ToUniversalTime().ToString("o")
     $targetUrl = "$targetFolder/$($File.Name)"
 
-    $upsertParameters = @{
-        Query = @"
+    $upsertValues = @{
+        FullPath           = $File.FullName
+        RelativePath       = $relativePath
+        Extension          = $extension
+        FileHash           = $FileHash
+        PreviousFileHash   = $previousFileHash
+        HashChanged        = $hashChanged
+        LastHashChangedAt  = $lastHashChangedAt
+        SizeBytes          = $File.Length
+        LastWriteTimeUtc   = $File.LastWriteTimeUtc.ToString("o")
+        TargetFolder       = $targetFolder
+        TargetUrl          = $targetUrl
+        Status             = $status
+        AttemptCount       = $attemptCount
+        LastError          = $lastError
+        LastInventorySeenAt = $InventorySeenAt
+        CreatedAt          = $now
+        UpdatedAt          = $now
+        UploadedAt         = $uploadedAt
+    }
+
+    if ($null -ne $Writer) {
+        Invoke-MigrationFileWriterUpsert -Writer $Writer -Values $upsertValues
+    }
+    else {
+        $upsertParameters = @{
+            Query = @"
 INSERT INTO Files (
     FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, LastHashChangedAt, SizeBytes, LastWriteTimeUtc,
     TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
@@ -605,35 +887,17 @@ ON CONFLICT(FullPath) DO UPDATE SET
     UpdatedAt = excluded.UpdatedAt,
     UploadedAt = excluded.UploadedAt;
 "@
-        SqlParameters = @{
-            FullPath         = $File.FullName
-            RelativePath     = $relativePath
-            Extension        = $extension
-            FileHash         = $FileHash
-            PreviousFileHash = $previousFileHash
-            HashChanged      = $hashChanged
-            LastHashChangedAt = $lastHashChangedAt
-            SizeBytes        = $File.Length
-            LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString("o")
-            TargetFolder     = $targetFolder
-            TargetUrl        = $targetUrl
-            Status           = $status
-            AttemptCount     = $attemptCount
-            LastError        = $lastError
-            LastInventorySeenAt = $InventorySeenAt
-            CreatedAt        = $now
-            UpdatedAt        = $now
-            UploadedAt       = $uploadedAt
+            SqlParameters = $upsertValues
         }
-    }
-    if ($null -ne $SQLiteConnection) {
-        $upsertParameters.SQLiteConnection = $SQLiteConnection
-    }
-    else {
-        $upsertParameters.DataSource = $DatabasePath
-    }
+        if ($null -ne $SQLiteConnection) {
+            $upsertParameters.SQLiteConnection = $SQLiteConnection
+        }
+        else {
+            $upsertParameters.DataSource = $DatabasePath
+        }
 
-    Invoke-SqliteQuery @upsertParameters | Out-Null
+        Invoke-SqliteQuery @upsertParameters | Out-Null
+    }
 
     return [pscustomobject]@{
         IsNew          = $isNew
@@ -702,7 +966,9 @@ function Set-MigrationFileExcluded {
         [Parameter(Mandatory)]
         [string]$InventorySeenAt,
 
-        [object]$SQLiteConnection
+        [object]$SQLiteConnection,
+
+        [object]$Writer
     )
 
     $relativePath = Convert-ToSharePointRelativePath -BasePath $SourceRoot -FilePath $File.FullName
@@ -715,8 +981,25 @@ function Set-MigrationFileExcluded {
     }
     $extension = [System.IO.Path]::GetExtension($File.Name).Trim().TrimStart(".").ToLowerInvariant()
     $now = (Get-Date).ToUniversalTime().ToString("o")
-    $queryParameters = @{
-        Query = @"
+    $excludedValues = @{
+        FullPath           = $File.FullName
+        RelativePath       = $relativePath
+        Extension          = $extension
+        SizeBytes          = $File.Length
+        LastWriteTimeUtc   = $File.LastWriteTimeUtc.ToString("o")
+        TargetFolder       = $targetFolder
+        TargetUrl          = "$targetFolder/$($File.Name)"
+        LastInventorySeenAt = $InventorySeenAt
+        CreatedAt          = $now
+        UpdatedAt          = $now
+    }
+
+    if ($null -ne $Writer) {
+        Invoke-MigrationFileWriterExcluded -Writer $Writer -Values $excludedValues
+    }
+    else {
+        $queryParameters = @{
+            Query = @"
 INSERT INTO Files (
     FullPath, RelativePath, Extension, FileHash, PreviousFileHash, HashChanged, SizeBytes, LastWriteTimeUtc,
     TargetFolder, TargetUrl, Status, StatusBeforeExclusion, AttemptCount, LastError, LastInventorySeenAt,
@@ -740,27 +1023,17 @@ ON CONFLICT(FullPath) DO UPDATE SET
     LastInventorySeenAt = excluded.LastInventorySeenAt,
     UpdatedAt = excluded.UpdatedAt;
 "@
-        SqlParameters = @{
-            FullPath           = $File.FullName
-            RelativePath       = $relativePath
-            Extension          = $extension
-            SizeBytes          = $File.Length
-            LastWriteTimeUtc   = $File.LastWriteTimeUtc.ToString("o")
-            TargetFolder       = $targetFolder
-            TargetUrl          = "$targetFolder/$($File.Name)"
-            LastInventorySeenAt = $InventorySeenAt
-            CreatedAt          = $now
-            UpdatedAt          = $now
+            SqlParameters = $excludedValues
         }
-    }
-    if ($null -ne $SQLiteConnection) {
-        $queryParameters.SQLiteConnection = $SQLiteConnection
-    }
-    else {
-        $queryParameters.DataSource = $DatabasePath
-    }
+        if ($null -ne $SQLiteConnection) {
+            $queryParameters.SQLiteConnection = $SQLiteConnection
+        }
+        else {
+            $queryParameters.DataSource = $DatabasePath
+        }
 
-    Invoke-SqliteQuery @queryParameters | Out-Null
+        Invoke-SqliteQuery @queryParameters | Out-Null
+    }
 }
 
 function Reset-FailedMigrationFiles {

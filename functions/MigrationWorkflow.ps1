@@ -625,38 +625,59 @@ function Invoke-ProjectInventory {
         $transactionResult = Invoke-MigrationDatabaseTransaction -DatabasePath $ProjectInfo.DatabasePath -Action {
             param($connection)
 
-            Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
+            $writer = New-MigrationFileWriter -SQLiteConnection $connection
 
-            foreach ($fingerprint in $preparedFiles) {
-                $null = Upsert-MigrationFile `
+            try {
+                Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
+
+                $appliedFiles = 0
+                foreach ($fingerprint in $preparedFiles) {
+                    $null = Upsert-MigrationFile `
+                        -DatabasePath $ProjectInfo.DatabasePath `
+                        -File ([System.IO.FileInfo]::new($fingerprint.FullPath)) `
+                        -SourceRoot $Context.SourceRoot `
+                        -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                        -BlockedExtensions $BlockedExtensions `
+                        -InventorySeenAt $inventorySeenAt `
+                        -HashMode $Context.HashMode `
+                        -FileHash $fingerprint.FileHash `
+                        -FingerprintProvided `
+                        -SQLiteConnection $connection `
+                        -Writer $writer
+
+                    $appliedFiles++
+                    if ($appliedFiles -eq $preparedFiles.Count -or $appliedFiles % $Context.ProcessingBatchSize -eq 0) {
+                        Write-Log -Level "INFO" -Message "Application inventaire SQLite: $appliedFiles/$($preparedFiles.Count)"
+                    }
+                }
+
+                $appliedExcluded = 0
+                foreach ($file in $excludedFiles) {
+                    Set-MigrationFileExcluded `
+                        -DatabasePath $ProjectInfo.DatabasePath `
+                        -File $file `
+                        -SourceRoot $Context.SourceRoot `
+                        -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                        -InventorySeenAt $inventorySeenAt `
+                        -SQLiteConnection $connection `
+                        -Writer $writer
+
+                    $appliedExcluded++
+                    if ($appliedExcluded -eq $excludedFiles.Count -or $appliedExcluded % $Context.ProcessingBatchSize -eq 0) {
+                        Write-Log -Level "INFO" -Message "Application exclusions SQLite: $appliedExcluded/$($excludedFiles.Count)"
+                    }
+                }
+
+                $missing = Update-MissingInventoryFiles `
                     -DatabasePath $ProjectInfo.DatabasePath `
-                    -File ([System.IO.FileInfo]::new($fingerprint.FullPath)) `
-                    -SourceRoot $Context.SourceRoot `
-                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
-                    -BlockedExtensions $BlockedExtensions `
-                    -InventorySeenAt $inventorySeenAt `
-                    -HashMode $Context.HashMode `
-                    -FileHash $fingerprint.FileHash `
-                    -FingerprintProvided `
-                    -SQLiteConnection $connection
-            }
-
-            foreach ($file in $excludedFiles) {
-                Set-MigrationFileExcluded `
-                    -DatabasePath $ProjectInfo.DatabasePath `
-                    -File $file `
-                    -SourceRoot $Context.SourceRoot `
-                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
                     -InventorySeenAt $inventorySeenAt `
                     -SQLiteConnection $connection
+
+                [pscustomobject]@{ MissingCount = $missing }
             }
-
-            $missing = Update-MissingInventoryFiles `
-                -DatabasePath $ProjectInfo.DatabasePath `
-                -InventorySeenAt $inventorySeenAt `
-                -SQLiteConnection $connection
-
-            [pscustomobject]@{ MissingCount = $missing }
+            finally {
+                Close-MigrationFileWriter -Writer $writer
+            }
         }
 
         $missingCount = [int]$transactionResult.MissingCount
@@ -724,64 +745,81 @@ function Invoke-ProjectDeltaInventory {
             $changedCount = 0
             $statusChangedCount = 0
             $unchangedCount = 0
-            Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
+            $writer = New-MigrationFileWriter -SQLiteConnection $connection
 
-            foreach ($fingerprint in $preparedFiles) {
-                $file = [System.IO.FileInfo]::new($fingerprint.FullPath)
-                $upsertResult = Upsert-MigrationFile `
-                    -DatabasePath $ProjectInfo.DatabasePath `
-                    -File $file `
-                    -SourceRoot $Context.SourceRoot `
-                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
-                    -BlockedExtensions $BlockedExtensions `
-                    -InventorySeenAt $inventorySeenAt `
-                    -HashMode $Context.HashMode `
-                    -FileHash $fingerprint.FileHash `
-                    -FingerprintProvided `
-                    -SQLiteConnection $connection
+            try {
+                Reset-MigrationHashChanges -DatabasePath $ProjectInfo.DatabasePath -SQLiteConnection $connection
 
-                if ($upsertResult.IsNew) {
-                    $newCount++
-                    continue
+                $appliedFiles = 0
+                foreach ($fingerprint in $preparedFiles) {
+                    $file = [System.IO.FileInfo]::new($fingerprint.FullPath)
+                    $upsertResult = Upsert-MigrationFile `
+                        -DatabasePath $ProjectInfo.DatabasePath `
+                        -File $file `
+                        -SourceRoot $Context.SourceRoot `
+                        -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                        -BlockedExtensions $BlockedExtensions `
+                        -InventorySeenAt $inventorySeenAt `
+                        -HashMode $Context.HashMode `
+                        -FileHash $fingerprint.FileHash `
+                        -FingerprintProvided `
+                        -SQLiteConnection $connection `
+                        -Writer $writer
+
+                    if ($upsertResult.IsNew) {
+                        $newCount++
+                    }
+                    elseif ($upsertResult.ContentChanged) {
+                        $changedCount++
+                    }
+                    elseif ($upsertResult.StatusChanged) {
+                        $statusChangedCount++
+                    }
+                    else {
+                        $unchangedCount++
+                    }
+
+                    $appliedFiles++
+                    if ($appliedFiles -eq $preparedFiles.Count -or $appliedFiles % $Context.ProcessingBatchSize -eq 0) {
+                        Write-Log -Level "INFO" -Message "Application delta SQLite: $appliedFiles/$($preparedFiles.Count)"
+                    }
                 }
 
-                if ($upsertResult.ContentChanged) {
-                    $changedCount++
-                    continue
+                $appliedExcluded = 0
+                foreach ($file in $excludedFiles) {
+                    Set-MigrationFileExcluded `
+                        -DatabasePath $ProjectInfo.DatabasePath `
+                        -File $file `
+                        -SourceRoot $Context.SourceRoot `
+                        -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
+                        -InventorySeenAt $inventorySeenAt `
+                        -SQLiteConnection $connection `
+                        -Writer $writer
+
+                    $appliedExcluded++
+                    if ($appliedExcluded -eq $excludedFiles.Count -or $appliedExcluded % $Context.ProcessingBatchSize -eq 0) {
+                        Write-Log -Level "INFO" -Message "Application exclusions SQLite: $appliedExcluded/$($excludedFiles.Count)"
+                    }
                 }
 
-                if ($upsertResult.StatusChanged) {
-                    $statusChangedCount++
-                    continue
+                $missingCount = 0
+                if ($IncludeDeleted) {
+                    $missingCount = Update-MissingInventoryFiles `
+                        -DatabasePath $ProjectInfo.DatabasePath `
+                        -InventorySeenAt $inventorySeenAt `
+                        -SQLiteConnection $connection
                 }
 
-                $unchangedCount++
+                [pscustomobject]@{
+                    NewCount           = $newCount
+                    ChangedCount       = $changedCount
+                    StatusChangedCount = $statusChangedCount
+                    UnchangedCount     = $unchangedCount
+                    MissingCount       = $missingCount
+                }
             }
-
-            foreach ($file in $excludedFiles) {
-                Set-MigrationFileExcluded `
-                    -DatabasePath $ProjectInfo.DatabasePath `
-                    -File $file `
-                    -SourceRoot $Context.SourceRoot `
-                    -ServerRelativeRoot $Context.Destination.ServerRelativeRoot `
-                    -InventorySeenAt $inventorySeenAt `
-                    -SQLiteConnection $connection
-            }
-
-            $missingCount = 0
-            if ($IncludeDeleted) {
-                $missingCount = Update-MissingInventoryFiles `
-                    -DatabasePath $ProjectInfo.DatabasePath `
-                    -InventorySeenAt $inventorySeenAt `
-                    -SQLiteConnection $connection
-            }
-
-            [pscustomobject]@{
-                NewCount           = $newCount
-                ChangedCount       = $changedCount
-                StatusChangedCount = $statusChangedCount
-                UnchangedCount     = $unchangedCount
-                MissingCount       = $missingCount
+            finally {
+                Close-MigrationFileWriter -Writer $writer
             }
         }
 

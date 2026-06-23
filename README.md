@@ -96,6 +96,7 @@ La configuration se fait dans `config.xml`.
         <ParallelUploads>4</ParallelUploads>
         <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
         <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
+        <IncludeHiddenItems>false</IncludeHiddenItems>
         <ProcessingBatchSize>1000</ProcessingBatchSize>
     </Migration>
 
@@ -133,6 +134,7 @@ Champs importants:
 - `Migration.ParallelUploads`: nombre d'uploads simultanes, entre `1` et `16`. Commencer avec `4`.
 - `Migration.AssumeDestinationEmpty`: si `true`, ne controle pas l'existence distante avant chaque upload.
 - `Migration.TreatTenantSyncExclusionsAsBlocked`: si `true`, traite les extensions exclues de la synchronisation OneDrive comme non migrables. Ces restrictions ne sont pas des interdictions d'upload SharePoint; l'option est desactivee par defaut et exige des droits d'administration tenant pendant l'inventaire.
+- `Migration.IncludeHiddenItems`: si `true`, l'inventaire, le delta et le controle de changements utilisent aussi les fichiers caches/systeme. Les dossiers vides ne sont pas inventories comme elements separes.
 - `Migration.ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. Defaut: `1000`.
 - `Exclusions.Files.Pattern`: motifs de fichiers a exclure. Les motifs sont compares au nom du fichier et au chemin relatif.
 - `Exclusions.Folders.Pattern`: motifs de dossiers a exclure. Les motifs sont compares aux segments de dossiers et au chemin relatif du dossier.
@@ -683,6 +685,7 @@ Les limites de migration sont configurees dans le `config.xml` du projet:
     <ParallelUploads>4</ParallelUploads>
     <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
     <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
+    <IncludeHiddenItems>false</IncludeHiddenItems>
     <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
@@ -694,6 +697,7 @@ Les limites de migration sont configurees dans le `config.xml` du projet:
 - `ParallelUploads`: nombre d'uploads executes simultanement. Augmenter progressivement pour surveiller le throttling SharePoint.
 - `AssumeDestinationEmpty`: supprime un appel distant par fichier, mais peut ecraser un fichier SharePoint non reference dans SQLite.
 - `TreatTenantSyncExclusionsAsBlocked`: transforme explicitement les exclusions de synchronisation OneDrive en blocages de migration. Cette option ne decrit pas les restrictions natives d'upload SharePoint.
+- `IncludeHiddenItems`: inclut les fichiers caches/systeme dans `-Inventory`, `-DeltaInventory` et `-CheckChanges`. Laisser `false` pour garder le comportement PowerShell standard.
 - `ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. L'enumeration locale complete reste chargee en memoire. `1000` convient a la plupart des migrations.
 
 Dans un projet existant, modifier le fichier:

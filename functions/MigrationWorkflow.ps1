@@ -60,6 +60,7 @@ function Show-MigrationHelp {
     Write-Host "  Migration.MaxAttemptsPerFile Nombre max de tentatives par fichier. 0 = illimite."
     Write-Host "  Migration.MaxTotalErrors    Nombre max d'erreurs par execution. 0 = illimite."
     Write-Host "  Migration.ParallelUploads   Nombre d'uploads simultanes. Defaut: 4."
+    Write-Host "  Migration.IncludeHiddenItems Inclut les fichiers caches/systeme dans l'inventaire."
     Write-Host "  Migration.AssumeDestinationEmpty Ignore Get-PnPFile avant chaque upload."
     Write-Host "  Migration.TreatTenantSyncExclusionsAsBlocked Politique optionnelle de compatibilite OneDrive."
     Write-Host "  Migration.ProcessingBatchSize Nombre de lignes SQLite chargees par page."
@@ -178,6 +179,7 @@ function Get-MigrationContext {
     $assumeDestinationEmpty = $false
     $treatTenantSyncExclusionsAsBlocked = $false
     $processingBatchSize = 1000
+    $includeHiddenItems = $false
 
     if ($null -ne $migrationNode) {
         $maxAttemptsNode = $migrationNode.SelectSingleNode("MaxAttemptsPerFile")
@@ -188,6 +190,7 @@ function Get-MigrationContext {
         $assumeDestinationEmptyNode = $migrationNode.SelectSingleNode("AssumeDestinationEmpty")
         $tenantSyncExclusionsNode = $migrationNode.SelectSingleNode("TreatTenantSyncExclusionsAsBlocked")
         $processingBatchSizeNode = $migrationNode.SelectSingleNode("ProcessingBatchSize")
+        $includeHiddenItemsNode = $migrationNode.SelectSingleNode("IncludeHiddenItems")
 
         if ($null -ne $maxAttemptsNode -and -not [string]::IsNullOrWhiteSpace($maxAttemptsNode.InnerText)) {
             $maxAttemptsPerFile = [int]$maxAttemptsNode.InnerText
@@ -219,6 +222,10 @@ function Get-MigrationContext {
 
         if ($null -ne $processingBatchSizeNode -and -not [string]::IsNullOrWhiteSpace($processingBatchSizeNode.InnerText)) {
             $processingBatchSize = [int]$processingBatchSizeNode.InnerText
+        }
+
+        if ($null -ne $includeHiddenItemsNode -and -not [string]::IsNullOrWhiteSpace($includeHiddenItemsNode.InnerText)) {
+            $includeHiddenItems = [System.Convert]::ToBoolean($includeHiddenItemsNode.InnerText)
         }
     }
 
@@ -315,6 +322,7 @@ function Get-MigrationContext {
         AssumeDestinationEmpty = $assumeDestinationEmpty
         TreatTenantSyncExclusionsAsBlocked = $treatTenantSyncExclusionsAsBlocked
         ProcessingBatchSize   = $processingBatchSize
+        IncludeHiddenItems    = $includeHiddenItems
     }
 }
 
@@ -373,7 +381,17 @@ function Get-MigrationSourceFiles {
         [switch]$Detailed
     )
 
-    $files = @(Get-ChildItem -LiteralPath $Context.SourceRoot -File -Recurse)
+    $childItemParameters = @{
+        LiteralPath = $Context.SourceRoot
+        File        = $true
+        Recurse     = $true
+    }
+
+    if ($Context.IncludeHiddenItems) {
+        $childItemParameters.Force = $true
+    }
+
+    $files = @(Get-ChildItem @childItemParameters)
     $includedFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new($files.Count)
     $excludedFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
     $excludedCount = 0

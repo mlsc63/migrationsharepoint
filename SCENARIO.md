@@ -38,6 +38,7 @@ Exemple de configuration fonctionnelle:
     <ParallelUploads>4</ParallelUploads>
     <AssumeDestinationEmpty>false</AssumeDestinationEmpty>
     <TreatTenantSyncExclusionsAsBlocked>false</TreatTenantSyncExclusionsAsBlocked>
+    <IncludeHiddenItems>false</IncludeHiddenItems>
     <ProcessingBatchSize>1000</ProcessingBatchSize>
 </Migration>
 ```
@@ -51,6 +52,7 @@ Dans ce scenario:
 - `ParallelUploads` execute plusieurs uploads simultanement;
 - `AssumeDestinationEmpty` controle si l'existence distante est verifiee avant chaque upload;
 - `TreatTenantSyncExclusionsAsBlocked` permet, si necessaire, de traiter les exclusions de synchronisation OneDrive comme une politique de migration;
+- `IncludeHiddenItems` controle si les fichiers caches/systeme sont inclus dans l'inventaire;
 - `ProcessingBatchSize` controle les lots de hash et les pages SQLite, sans limiter l'enumeration locale complete.
 
 ## Etape 1 - Afficher l'aide

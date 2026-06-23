@@ -751,7 +751,10 @@ function Upsert-MigrationFile {
 
     if ($null -ne $Writer) {
         $existingFile = Get-MigrationFileWriterExistingRow -Writer $Writer -FullPath $File.FullName
-        $existingRows = if ($null -ne $existingFile) { @($existingFile) } else { @() }
+        $existingRows = @()
+        if ($null -ne $existingFile) {
+            $existingRows = @($existingFile)
+        }
     }
     else {
         $selectParameters = @{

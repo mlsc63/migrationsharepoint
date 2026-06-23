@@ -1278,6 +1278,299 @@ function Invoke-ParallelMigrationUploads {
     } -ThrottleLimit $ThrottleLimit
 }
 
+function Start-MigrationUploadWorker {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Concurrent.BlockingCollection[object]]$WorkQueue,
+
+        [Parameter(Mandatory)]
+        [System.Collections.Concurrent.BlockingCollection[object]]$ResultQueue,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [int]$WorkerId,
+
+        [int]$MaxAttemptsPerFile = 3,
+
+        [switch]$Overwrite,
+
+        [switch]$AssumeDestinationEmpty
+    )
+
+    Start-ThreadJob -Name "MigrationUpload-$WorkerId" -ArgumentList @(
+        $WorkQueue,
+        $ResultQueue,
+        $Context,
+        $DatabasePath,
+        [bool]$Overwrite,
+        [bool]$AssumeDestinationEmpty,
+        $MaxAttemptsPerFile
+    ) -ScriptBlock {
+        param(
+            $Queue,
+            $Results,
+            $WorkerContext,
+            $WorkerDatabasePath,
+            [bool]$WorkerOverwrite,
+            [bool]$WorkerAssumeDestinationEmpty,
+            [int]$WorkerMaxAttempts
+        )
+
+        function Test-PnPNotFoundError {
+            param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+            $exception = $ErrorRecord.Exception
+            while ($null -ne $exception) {
+                $serverErrorCode = $exception.PSObject.Properties["ServerErrorCode"]
+                $serverErrorCodeText = if ($null -ne $serverErrorCode) { "$($serverErrorCode.Value)" } else { "" }
+                if ($serverErrorCodeText -in @("-2147024894", "404")) {
+                    return $true
+                }
+
+                $response = $exception.PSObject.Properties["Response"]
+                if ($null -ne $response -and $null -ne $response.Value) {
+                    $statusCode = $response.Value.PSObject.Properties["StatusCode"]
+                    $statusCodeText = if ($null -ne $statusCode) { "$($statusCode.Value)" } else { "" }
+                    if ($statusCodeText -match "^(404|NotFound)$") {
+                        return $true
+                    }
+                }
+
+                if ($exception.Message -match "(?i)(404|file not found|does not exist|introuvable|n'existe pas)") {
+                    return $true
+                }
+
+                $exception = $exception.InnerException
+            }
+
+            return $false
+        }
+
+        function Test-PnPTransientFolderError {
+            param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+            $exception = $ErrorRecord.Exception
+            while ($null -ne $exception) {
+                if ($exception.Message -match "(?i)(nullable object must have a value|timeout|temporar|throttl|429|502|503|connection|conflict|already exists|existe deja)") {
+                    return $true
+                }
+
+                $exception = $exception.InnerException
+            }
+
+            return $false
+        }
+
+        function Get-PnPFolderWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Url,
+
+                [Parameter(Mandatory)]
+                $Connection,
+
+                [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                try {
+                    Get-PnPFolder -Url $Url -Connection $Connection -ErrorAction Stop | Out-Null
+                    return
+                }
+                catch {
+                    if ($attempt -ge $MaxAttempts -or -not (Test-PnPTransientFolderError -ErrorRecord $_)) {
+                        throw
+                    }
+
+                    Start-Sleep -Milliseconds (200 * $attempt)
+                }
+            }
+        }
+
+        function Add-PnPFolderWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Name,
+
+                [Parameter(Mandatory)]
+                [string]$Folder,
+
+                [Parameter(Mandatory)]
+                [string]$Url,
+
+                [Parameter(Mandatory)]
+                $Connection,
+
+                [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                try {
+                    Add-PnPFolder -Name $Name -Folder $Folder -Connection $Connection -ErrorAction Stop | Out-Null
+                    Get-PnPFolderWithRetry -Url $Url -Connection $Connection -MaxAttempts $MaxAttempts
+                    return
+                }
+                catch {
+                    try {
+                        Get-PnPFolderWithRetry -Url $Url -Connection $Connection -MaxAttempts $MaxAttempts
+                        return
+                    }
+                    catch {
+                        if ($attempt -ge $MaxAttempts -or -not (Test-PnPTransientFolderError -ErrorRecord $_)) {
+                            throw "Impossible de creer ou verifier le dossier SharePoint '$Url' apres $attempt tentative(s): $($_.Exception.Message)"
+                        }
+                    }
+
+                    Start-Sleep -Milliseconds (250 * $attempt)
+                }
+            }
+        }
+
+        $connection = $null
+        $siteUrl = $WorkerContext.Destination.SiteUrl
+        $tenantId = $WorkerContext.TenantId
+        $clientId = $WorkerContext.ClientId
+        $certificateThumbprint = $WorkerContext.CertificateThumbprint
+        $rootFolder = $WorkerContext.Destination.ServerRelativeRoot.TrimEnd("/")
+
+        foreach ($row in $Queue.GetConsumingEnumerable()) {
+            $operation = "Connexion SharePoint"
+            $attemptStarted = "$($row.Status)" -eq "Uploading"
+            $newAttemptStarted = $false
+            $isInterruptedUpload = "$($row.Status)" -eq "Uploading"
+
+            try {
+                if ($null -eq $connection) {
+                    Import-Module PnP.PowerShell -ErrorAction Stop
+                    Import-Module PSSQLite -ErrorAction Stop
+                    $connection = Connect-PnPOnline `
+                        -Url $siteUrl `
+                        -Tenant $tenantId `
+                        -ClientId $clientId `
+                        -Thumbprint $certificateThumbprint `
+                        -ReturnConnection `
+                        -ErrorAction Stop
+                }
+
+                $operation = "Creation/verification du dossier SharePoint"
+                $targetFolder = "$($row.TargetFolder)".TrimEnd("/")
+                if ($targetFolder -ne $rootFolder -and -not $targetFolder.StartsWith("$rootFolder/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Chemin SharePoint invalide: $($row.TargetFolder)"
+                }
+
+                $currentFolder = $rootFolder
+                Get-PnPFolderWithRetry -Url $currentFolder -Connection $connection
+                $relativeFolder = $targetFolder.Substring($rootFolder.Length).Trim("/")
+                $parts = @($relativeFolder -split "/" | Where-Object { $_ })
+
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $parentFolder = $currentFolder
+                    $currentFolder = "$currentFolder/$($parts[$i])"
+
+                    try {
+                        Get-PnPFolderWithRetry -Url $currentFolder -Connection $connection
+                    }
+                    catch {
+                        if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
+                            throw "Verification du dossier SharePoint impossible: $currentFolder - $($_.Exception.Message)"
+                        }
+
+                        Add-PnPFolderWithRetry -Name $parts[$i] -Folder $parentFolder -Url $currentFolder -Connection $connection
+                    }
+                }
+
+                $operation = "Verification de l'existence du fichier SharePoint"
+                $fileExists = $false
+                $mustCheckExistence = (-not $WorkerAssumeDestinationEmpty) -or $isInterruptedUpload
+
+                if ($mustCheckExistence) {
+                    try {
+                        Get-PnPFile -Url $row.TargetUrl -Connection $connection -ErrorAction Stop | Out-Null
+                        $fileExists = $true
+                    }
+                    catch {
+                        if (Test-PnPNotFoundError -ErrorRecord $_) {
+                            $fileExists = $false
+                        }
+                        else {
+                            throw
+                        }
+                    }
+                }
+
+                if ($fileExists -and ((-not $WorkerOverwrite) -or $isInterruptedUpload)) {
+                    $Results.Add([pscustomobject]@{
+                        Id             = [int]$row.Id
+                        RelativePath   = "$($row.RelativePath)"
+                        TargetUrl      = "$($row.TargetUrl)"
+                        SizeBytes      = [long]$row.SizeBytes
+                        Status         = "SkippedExists"
+                        Message        = if ($isInterruptedUpload) { "Upload precedent confirme dans SharePoint" } else { "Existe deja dans SharePoint" }
+                        AttemptStarted = $true
+                    })
+                    continue
+                }
+
+                if ($isInterruptedUpload -and $WorkerMaxAttempts -gt 0 -and [int]$row.AttemptCount -ge $WorkerMaxAttempts) {
+                    $Results.Add([pscustomobject]@{
+                        Id             = [int]$row.Id
+                        RelativePath   = "$($row.RelativePath)"
+                        TargetUrl      = "$($row.TargetUrl)"
+                        SizeBytes      = [long]$row.SizeBytes
+                        Status         = "Failed"
+                        Message        = "Upload precedent absent de SharePoint et limite de tentatives atteinte ($($row.AttemptCount)/$WorkerMaxAttempts)"
+                        AttemptStarted = $true
+                    })
+                    continue
+                }
+
+                $operation = "Initialisation de la tentative SQLite"
+                $now = (Get-Date).ToUniversalTime().ToString("o")
+                Invoke-SqliteQuery `
+                    -DataSource $WorkerDatabasePath `
+                    -Query "PRAGMA busy_timeout=30000; UPDATE Files SET Status = 'Uploading', LastError = '', UpdatedAt = @UpdatedAt, AttemptCount = AttemptCount + 1 WHERE Id = @Id;" `
+                    -SqlParameters @{ UpdatedAt = $now; Id = [int]$row.Id } | Out-Null
+                $attemptStarted = $true
+                $newAttemptStarted = $true
+
+                if ($fileExists -and $WorkerOverwrite) {
+                    $operation = "Suppression du fichier cible avant ecrasement"
+                    Remove-PnPFile -ServerRelativeUrl $row.TargetUrl -Force -Connection $connection -ErrorAction Stop
+                }
+
+                $operation = "Upload du fichier vers SharePoint"
+                Add-PnPFile -Path $row.FullPath -Folder $row.TargetFolder -Connection $connection -ErrorAction Stop | Out-Null
+
+                $Results.Add([pscustomobject]@{
+                    Id             = [int]$row.Id
+                    RelativePath   = "$($row.RelativePath)"
+                    TargetUrl      = "$($row.TargetUrl)"
+                    SizeBytes      = [long]$row.SizeBytes
+                    Status         = "Uploaded"
+                    Message        = ""
+                    AttemptStarted = $attemptStarted
+                })
+            }
+            catch {
+                $Results.Add([pscustomobject]@{
+                    Id             = [int]$row.Id
+                    RelativePath   = "$($row.RelativePath)"
+                    TargetUrl      = "$($row.TargetUrl)"
+                    SizeBytes      = [long]$row.SizeBytes
+                    Status         = if ($isInterruptedUpload -and -not $newAttemptStarted) { "RetryUncertain" } else { "Failed" }
+                    Message        = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
+                    AttemptStarted = $attemptStarted
+                })
+            }
+        }
+    }
+}
+
 function Invoke-ProjectMigration {
     param(
         [Parameter(Mandatory)]
@@ -1352,111 +1645,205 @@ function Invoke-ProjectMigration {
             Write-Log -Level "WARN" -Message "Le mode AssumeDestinationEmpty peut ecraser un fichier distant non reference dans la base projet."
         }
 
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+            throw "Les uploads continus necessitent PowerShell 7 ou plus recent."
+        }
+
         $afterFileId = 0
         $processedFileCount = 0
+        $enqueuedUploads = 0
+        $completedUploads = 0
+        $producerDone = $false
+        $currentPage = @()
+        $currentPageIndex = 0
+        $queueCapacity = [Math]::Max($ParallelUploads * 4, $ParallelUploads)
+        $workQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new($queueCapacity)
+        $resultQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+        $workers = @()
 
-        while ($true) {
-            $batchSize = $Context.ProcessingBatchSize
-            if ($MaxFiles -gt 0) {
-                $remainingFiles = $MaxFiles - $processedFileCount
-                if ($remainingFiles -le 0) {
-                    break
+        function Receive-MigrationUploadResult {
+            param(
+                [Parameter(Mandatory)]
+                [object]$Result
+            )
+
+            $script:MigrationResultHandled = $true
+            $fileSize = Format-FileSize -Bytes ([long]$Result.SizeBytes)
+            $incrementAttempt = -not [bool]$Result.AttemptStarted
+
+            switch ($Result.Status) {
+                "Uploaded" {
+                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "Uploaded" -LastError "" -IncrementAttempt:$incrementAttempt -SetUploadedAt
+                    Write-Log -Level "SUCCESS" -Message "[OK] $($Result.RelativePath) - Cible: $($Result.TargetUrl) - Taille: $fileSize"
+                    $script:MigrationUploaded++
                 }
+                "SkippedExists" {
+                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "SkippedExists" -LastError $Result.Message -IncrementAttempt:$incrementAttempt
+                    Write-Log -Level "WARN" -Message "[SKIP] Existe deja: $($Result.TargetUrl) - Taille: $fileSize"
+                    $script:MigrationSkipped++
+                }
+                "RetryUncertain" {
+                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "Uploading" -LastError $Result.Message
+                    Write-Log -Level "ERROR" -Message "[INCERTAIN] $($Result.RelativePath) - Taille: $fileSize - $($Result.Message)"
+                    $script:MigrationFailed++
+                }
+                default {
+                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "Failed" -LastError $Result.Message -IncrementAttempt:$incrementAttempt
+                    Write-Log -Level "ERROR" -Message "[ERREUR] $($Result.RelativePath) - Taille: $fileSize - $($Result.Message)"
+                    $script:MigrationFailed++
+                }
+            }
+        }
 
-                $batchSize = [Math]::Min($Context.ProcessingBatchSize, $remainingFiles)
+        $script:MigrationUploaded = $uploaded
+        $script:MigrationSkipped = $skipped
+        $script:MigrationFailed = $failed
+        $script:MigrationResultHandled = $false
+
+        try {
+            for ($workerId = 1; $workerId -le $ParallelUploads; $workerId++) {
+                $workers += Start-MigrationUploadWorker `
+                    -WorkQueue $workQueue `
+                    -ResultQueue $resultQueue `
+                    -Context $Context `
+                    -DatabasePath $ProjectInfo.DatabasePath `
+                    -WorkerId $workerId `
+                    -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
+                    -Overwrite:$Overwrite `
+                    -AssumeDestinationEmpty:$AssumeDestinationEmpty
             }
 
-            $filesToProcess = @(Get-MigrationFilesToProcess `
-                -DatabasePath $ProjectInfo.DatabasePath `
-                -IncludeFailed:$IncludeFailed `
-                -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
-                -AfterId $afterFileId `
-                -BatchSize $batchSize)
+            while (-not $producerDone -or $completedUploads -lt $enqueuedUploads) {
+                $madeProgress = $false
 
-            if ($filesToProcess.Count -eq 0) {
-                break
-            }
+                while (-not $producerDone -and -not $workQueue.IsAddingCompleted -and $workQueue.Count -lt $queueCapacity) {
+                    if ($currentPageIndex -ge $currentPage.Count) {
+                        $batchSize = $Context.ProcessingBatchSize
+                        if ($MaxFiles -gt 0) {
+                            $remainingFiles = $MaxFiles - ($processedFileCount + $enqueuedUploads - $completedUploads)
+                            if ($remainingFiles -le 0) {
+                                $producerDone = $true
+                                $workQueue.CompleteAdding()
+                                break
+                            }
 
-            $afterFileId = [int](($filesToProcess | Measure-Object -Property Id -Maximum).Maximum)
-            $uploadRows = [System.Collections.Generic.List[object]]::new()
+                            $batchSize = [Math]::Min($Context.ProcessingBatchSize, $remainingFiles)
+                        }
 
-            foreach ($row in $filesToProcess) {
-            $fileSize = Format-FileSize -Bytes ([long]$row.SizeBytes)
+                        $currentPage = @(Get-MigrationFilesToProcess `
+                            -DatabasePath $ProjectInfo.DatabasePath `
+                            -IncludeFailed:$IncludeFailed `
+                            -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
+                            -AfterId $afterFileId `
+                            -BatchSize $batchSize)
 
-            if (-not (Test-Path -LiteralPath $row.FullPath)) {
-                Write-Log -Level "WARN" -Message "[MANQUANT] $($row.RelativePath) - $($row.FullPath)"
+                        $currentPageIndex = 0
+                        if ($currentPage.Count -eq 0) {
+                            $producerDone = $true
+                            $workQueue.CompleteAdding()
+                            break
+                        }
 
-                if ($DeleteRemoteMissing) {
+                        $afterFileId = [int](($currentPage | Measure-Object -Property Id -Maximum).Maximum)
+                    }
+
+                    if ($producerDone -or $currentPageIndex -ge $currentPage.Count) {
+                        break
+                    }
+
+                    $row = $currentPage[$currentPageIndex]
+                    $currentPageIndex++
+                    $fileSize = Format-FileSize -Bytes ([long]$row.SizeBytes)
+
+                    if (-not (Test-Path -LiteralPath $row.FullPath)) {
+                        Write-Log -Level "WARN" -Message "[MANQUANT] $($row.RelativePath) - $($row.FullPath)"
+
+                        if ($DeleteRemoteMissing) {
+                            if ($WhatIf) {
+                                Write-Log -Level "INFO" -Message "[WHATIF] Suppression distante du fichier local manquant: $($row.TargetUrl)"
+                            }
+                            else {
+                                Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
+                                $remoteDeleteCandidates.Add($row)
+                            }
+                        }
+                        else {
+                            Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
+                            $script:MigrationFailed++
+                            if ($maxTotalErrors -gt 0 -and $script:MigrationFailed -ge $maxTotalErrors) {
+                                throw "Seuil d'erreurs atteint ($script:MigrationFailed/$maxTotalErrors). Arret de la migration."
+                            }
+                        }
+
+                        $processedFileCount++
+                        $madeProgress = $true
+                        continue
+                    }
+
                     if ($WhatIf) {
-                        Write-Log -Level "INFO" -Message "[WHATIF] Suppression distante du fichier local manquant: $($row.TargetUrl)"
+                        Write-Log -Level "INFO" -Message "[WHATIF] $($row.FullPath) -> $($row.TargetUrl) - Taille: $fileSize"
+                        $processedFileCount++
+                        $madeProgress = $true
+                        continue
+                    }
+
+                    if ($workQueue.TryAdd($row, 100)) {
+                        $enqueuedUploads++
+                        $madeProgress = $true
                     }
                     else {
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
-                        $remoteDeleteCandidates.Add($row)
+                        $currentPageIndex--
+                        break
                     }
                 }
-                else {
-                    Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $row.Id -Status "MissingLocalFile" -LastError "Fichier local introuvable"
-                    $failed++
-                    if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
-                        throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
+
+                $result = $null
+                while ($resultQueue.TryTake([ref]$result, 50)) {
+                    Receive-MigrationUploadResult -Result $result
+                    $completedUploads++
+                    $processedFileCount++
+                    $madeProgress = $true
+
+                    if ($processedFileCount -eq $totalFilesToProcess -or $processedFileCount % $Context.ProcessingBatchSize -eq 0) {
+                        Write-Log -Level "INFO" -Message "Progression du run: $processedFileCount/$totalFilesToProcess"
                     }
+
+                    if ($maxTotalErrors -gt 0 -and $script:MigrationFailed -ge $maxTotalErrors) {
+                        throw "Seuil d'erreurs atteint ($script:MigrationFailed/$maxTotalErrors). Arret de la migration."
+                    }
+
+                    $result = $null
                 }
-                continue
+
+                if (-not $madeProgress) {
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+        }
+        finally {
+            if (-not $workQueue.IsAddingCompleted) {
+                $workQueue.CompleteAdding()
             }
 
-            if ($WhatIf) {
-                Write-Log -Level "INFO" -Message "[WHATIF] $($row.FullPath) -> $($row.TargetUrl) - Taille: $fileSize"
-                continue
+            if ($completedUploads -ge $enqueuedUploads -and $workers.Count -gt 0) {
+                Wait-Job -Job $workers -Timeout 30 -ErrorAction SilentlyContinue | Out-Null
             }
 
-            $uploadRows.Add($row)
+            foreach ($worker in $workers) {
+                if ($worker.State -eq "Running") {
+                    Stop-Job -Job $worker -ErrorAction SilentlyContinue
+                }
+
+                Receive-Job -Job $worker -ErrorAction SilentlyContinue | Out-Null
+                Remove-Job -Job $worker -Force -ErrorAction SilentlyContinue
             }
 
-            Invoke-ParallelMigrationUploads `
-                -Rows $uploadRows.ToArray() `
-                -Context $Context `
-                -DatabasePath $ProjectInfo.DatabasePath `
-                -ThrottleLimit $ParallelUploads `
-                -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
-                -Overwrite:$Overwrite `
-                -AssumeDestinationEmpty:$AssumeDestinationEmpty |
-                ForEach-Object {
-                $result = $_
-                $fileSize = Format-FileSize -Bytes ([long]$result.SizeBytes)
-                $incrementAttempt = -not [bool]$result.AttemptStarted
+            $uploaded = $script:MigrationUploaded
+            $skipped = $script:MigrationSkipped
+            $failed = $script:MigrationFailed
+        }
 
-                switch ($result.Status) {
-                    "Uploaded" {
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Uploaded" -LastError "" -IncrementAttempt:$incrementAttempt -SetUploadedAt
-                        Write-Log -Level "SUCCESS" -Message "[OK] $($result.RelativePath) - Cible: $($result.TargetUrl) - Taille: $fileSize"
-                        $uploaded++
-                    }
-                    "SkippedExists" {
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "SkippedExists" -LastError $result.Message -IncrementAttempt:$incrementAttempt
-                        Write-Log -Level "WARN" -Message "[SKIP] Existe deja: $($result.TargetUrl) - Taille: $fileSize"
-                        $skipped++
-                    }
-                    "RetryUncertain" {
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Uploading" -LastError $result.Message
-                        Write-Log -Level "ERROR" -Message "[INCERTAIN] $($result.RelativePath) - Taille: $fileSize - $($result.Message)"
-                        $failed++
-                        if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
-                            throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
-                        }
-                    }
-                    default {
-                        Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $result.Id -Status "Failed" -LastError $result.Message -IncrementAttempt:$incrementAttempt
-                        Write-Log -Level "ERROR" -Message "[ERREUR] $($result.RelativePath) - Taille: $fileSize - $($result.Message)"
-                        $failed++
-                        if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
-                            throw "Seuil d'erreurs atteint ($failed/$maxTotalErrors). Arret de la migration."
-                        }
-                    }
-                }
-                }
-
-            $processedFileCount += $filesToProcess.Count
+        if ($processedFileCount -gt 0 -and $processedFileCount % $Context.ProcessingBatchSize -ne 0) {
             Write-Log -Level "INFO" -Message "Progression du run: $processedFileCount/$totalFilesToProcess"
         }
 

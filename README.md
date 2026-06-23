@@ -780,9 +780,3 @@ Get-ChildItem -Path .\functions -Filter *.ps1 | ForEach-Object {
     $errors
 }
 ```
-
-## Ameliorations possibles
-
-- Ajouter une commande pour reinitialiser uniquement certains fichiers par chemin ou statut.
-- Ajouter une option de simulation de purge des rapports avant suppression.
-- Ajouter une verification distante des fichiers deja envoyes avec comparaison de taille ou checksum si disponible.

@@ -41,6 +41,7 @@ function Show-MigrationHelp {
     Write-Host "  -WhatIf                     Simule migration/reprise sans upload ni suppression SharePoint."
     Write-Host "  -Overwrite                  Supprime le fichier cible existant puis upload."
     Write-Host "  -ParallelUploads <1-16>    Nombre d'uploads simultanes. 0 = valeur XML."
+    Write-Host "  -MaxFiles <n>              Limite le nombre de fichiers traites avec -Migrate ou -Resume. 0 = illimite."
     Write-Host "  -AssumeDestinationEmpty    Ignore le controle d'existence distant avant upload."
     Write-Host "  -ExcludeFile <patterns>     Exclut des fichiers, ex: *.tmp,Thumbs.db."
     Write-Host "  -ExcludeFolder <patterns>   Exclut des dossiers, ex: node_modules,archive/*."
@@ -1183,14 +1184,26 @@ function Invoke-ProjectMigration {
         [ValidateRange(1, 16)]
         [int]$ParallelUploads = 4,
 
+        [int]$MaxFiles = 0,
+
         [switch]$AssumeDestinationEmpty
     )
 
+    if ($MaxFiles -lt 0) {
+        throw "MaxFiles doit etre superieur ou egal a 0."
+    }
+
     Reset-IncompleteUploads -DatabasePath $ProjectInfo.DatabasePath
-    $totalFilesToProcess = Get-MigrationFilesToProcessCount `
+    $availableFilesToProcess = Get-MigrationFilesToProcessCount `
         -DatabasePath $ProjectInfo.DatabasePath `
         -IncludeFailed:$IncludeFailed `
         -MaxAttemptsPerFile $Context.MaxAttemptsPerFile
+    $totalFilesToProcess = if ($MaxFiles -gt 0) {
+        [Math]::Min($availableFilesToProcess, $MaxFiles)
+    }
+    else {
+        $availableFilesToProcess
+    }
     $remoteDeleteCandidates = [System.Collections.Generic.List[object]]::new()
     if ($DeleteRemoteMissing) {
         foreach ($candidate in @(Get-MigrationRemoteDeleteCandidates `
@@ -1217,6 +1230,9 @@ function Invoke-ProjectMigration {
         Write-Log -Level "INFO" -Message "Erreurs max avant arret: $maxTotalErrors"
         Write-Log -Level "INFO" -Message "Suppression distante MissingLocalFile: $DeleteRemoteMissing"
         Write-Log -Level "INFO" -Message "Uploads paralleles: $ParallelUploads"
+        if ($MaxFiles -gt 0) {
+            Write-Log -Level "INFO" -Message "Limite fichiers de ce run: $MaxFiles (disponibles: $availableFilesToProcess)"
+        }
         Write-Log -Level "INFO" -Message "Taille des pages SQLite: $($Context.ProcessingBatchSize)"
         Write-Log -Level "INFO" -Message "Controle d'existence distant ignore: $AssumeDestinationEmpty"
         if ($AssumeDestinationEmpty) {
@@ -1227,12 +1243,22 @@ function Invoke-ProjectMigration {
         $processedFileCount = 0
 
         while ($true) {
+            $batchSize = $Context.ProcessingBatchSize
+            if ($MaxFiles -gt 0) {
+                $remainingFiles = $MaxFiles - $processedFileCount
+                if ($remainingFiles -le 0) {
+                    break
+                }
+
+                $batchSize = [Math]::Min($Context.ProcessingBatchSize, $remainingFiles)
+            }
+
             $filesToProcess = @(Get-MigrationFilesToProcess `
                 -DatabasePath $ProjectInfo.DatabasePath `
                 -IncludeFailed:$IncludeFailed `
                 -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
                 -AfterId $afterFileId `
-                -BatchSize $Context.ProcessingBatchSize)
+                -BatchSize $batchSize)
 
             if ($filesToProcess.Count -eq 0) {
                 break

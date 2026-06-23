@@ -217,6 +217,12 @@ Reprise apres interruption:
 .\main.ps1 -Project "Migration-Lunii" -Resume
 ```
 
+Reprise controlee sur un petit lot:
+
+```powershell
+.\main.ps1 -Project "Migration-Lunii" -Resume -MaxFiles 20
+```
+
 Afficher l'etat courant:
 
 ```powershell
@@ -422,6 +428,7 @@ Une seule action principale peut etre demandee par lancement. Par exemple, `-Inv
 - `-Help`: afficher l'aide integree.
 - `-Overwrite`: autoriser l'ecrasement des fichiers existants.
 - `-ParallelUploads`: surcharge le nombre d'uploads simultanes configure dans le XML.
+- `-MaxFiles`: avec `-Migrate` ou `-Resume`, limite le nombre de fichiers traites pendant ce lancement. `0` signifie illimite.
 - `-AssumeDestinationEmpty`: ignore le controle `Get-PnPFile` avant upload. A utiliser uniquement si la destination ne contient pas de fichiers externes au projet.
 - `-Inventory`: generer uniquement un inventaire. Avec `-Project`, l'inventaire est stocke dans `migration.db`.
 - `-DeltaInventory`: mettre a jour l'inventaire uniquement pour les fichiers nouveaux ou modifies.
@@ -465,7 +472,7 @@ Certaines commandes projet ne suivent pas ce flux complet:
 - `-Status` lit uniquement la base projet.
 - `-ExportReport` exporte les donnees de la table `Files`, un resume par statut, les erreurs et les modifications detectees.
 - `-CheckChanges` lit la base et le disque local, puis genere un rapport sans connexion SharePoint et sans modifier les statuts.
-- `-Migrate` et `-Resume` respectent `Migration.MaxAttemptsPerFile` et `Migration.MaxTotalErrors`.
+- `-Migrate` et `-Resume` respectent `Migration.MaxAttemptsPerFile`, `Migration.MaxTotalErrors` et la limite optionnelle `-MaxFiles`.
 
 ## Inventaire
 

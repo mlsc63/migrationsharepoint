@@ -22,6 +22,7 @@ param(
     [string[]]$ExcludeFolder,
     [ValidateRange(0, 16)]
     [int]$ParallelUploads = 0,
+    [int]$MaxFiles = 0,
     [switch]$AssumeDestinationEmpty
 )
 
@@ -60,6 +61,14 @@ if ($IncludeDeleted -and -not ($DeltaInventory -or $CheckChanges)) {
 
 if ($DeleteRemoteMissing -and -not ($Migrate -or $Resume)) {
     throw "-DeleteRemoteMissing est uniquement valable avec -Migrate ou -Resume."
+}
+
+if ($MaxFiles -lt 0) {
+    throw "-MaxFiles doit etre superieur ou egal a 0."
+}
+
+if ($MaxFiles -gt 0 -and -not ($Migrate -or $Resume)) {
+    throw "-MaxFiles est uniquement valable avec -Migrate ou -Resume."
 }
 
 if ($NewProject -and -not [string]::IsNullOrWhiteSpace($Project)) {
@@ -173,6 +182,7 @@ $effectiveParallelUploads = if ($ParallelUploads -gt 0) { $ParallelUploads } els
 $effectiveAssumeDestinationEmpty = $AssumeDestinationEmpty -or $context.AssumeDestinationEmpty
 Write-Log -Level "INFO" -Message "Inventaire parallele: $($context.ParallelInventory)"
 Write-Log -Level "INFO" -Message "Uploads paralleles: $effectiveParallelUploads"
+Write-Log -Level "INFO" -Message "Limite fichiers a traiter: $MaxFiles"
 Write-Log -Level "INFO" -Message "Destination supposee vide: $effectiveAssumeDestinationEmpty"
 if ($projectInfo) {
     Write-Log -Level "INFO" -Message "Projet: $($projectInfo.Name)"
@@ -219,6 +229,7 @@ if ($projectInfo) {
             -Overwrite:$Overwrite `
             -DeleteRemoteMissing:$DeleteRemoteMissing `
             -ParallelUploads $effectiveParallelUploads `
+            -MaxFiles $MaxFiles `
             -AssumeDestinationEmpty:$effectiveAssumeDestinationEmpty
         Write-Log -Level "INFO" -Message "Journal: $resolvedLogPath"
         return

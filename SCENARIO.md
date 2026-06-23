@@ -584,6 +584,7 @@ Pour une migration standard:
 | `-Status` | Lire l'etat courant de la migration. |
 | `-Migrate` | Migrer les fichiers eligibles. |
 | `-Resume` | Reprendre apres interruption, avec gestion des fichiers en erreur. |
+| `-MaxFiles` | Limiter un lancement `-Migrate` ou `-Resume` a un nombre de fichiers. |
 | `-ExportReport` | Produire les CSV de suivi. |
 | `-CheckChanges` | Observer les changements locaux sans modifier les statuts. |
 | `-DeltaInventory` | Integrer les fichiers nouveaux ou modifies dans la base. |

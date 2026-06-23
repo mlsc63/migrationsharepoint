@@ -247,6 +247,18 @@ VALUES ('C:\test\uncertain.txt', 'uncertain.txt', 1, @Now, '/sites/Test/Docs', '
         $failed | Should Be $true
     }
 
+    It "rejects MaxFiles outside migrate commands" {
+        $failed = $false
+        try {
+            & (Join-Path $projectRoot "main.ps1") -Inventory -MaxFiles 10
+        }
+        catch {
+            $failed = $_.Exception.Message -match "MaxFiles"
+        }
+
+        $failed | Should Be $true
+    }
+
     It "validates negative retry limits in XML" {
         $sourceDirectory = Join-Path $TestDrive "config-source"
         $configPath = Join-Path $TestDrive "invalid-config.xml"

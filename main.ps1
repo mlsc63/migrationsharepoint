@@ -168,7 +168,10 @@ if ($projectInfo) {
     $context.LogDirectory = $projectInfo.LogDirectory
 }
 
-$resolvedLogPath = Initialize-Log -LogDirectory $context.LogDirectory
+$resolvedLogPath = Initialize-Log `
+    -LogDirectory $context.LogDirectory `
+    -ConsoleMode $context.LogConsoleMode `
+    -FileMode $context.LogFileMode
 Write-Log -Level "INFO" -Message "Demarrage de la migration"
 Write-Log -Level "INFO" -Message "Fichier de configuration: $ConfigPath"
 Write-Log -Level "INFO" -Message "Mode simulation: $WhatIf"
@@ -184,6 +187,8 @@ Write-Log -Level "INFO" -Message "Inventaire parallele: $($context.ParallelInven
 Write-Log -Level "INFO" -Message "Uploads paralleles: $effectiveParallelUploads"
 Write-Log -Level "INFO" -Message "Limite fichiers a traiter: $MaxFiles"
 Write-Log -Level "INFO" -Message "Destination supposee vide: $effectiveAssumeDestinationEmpty"
+Write-Log -Level "INFO" -Message "Affichage console: $($context.LogConsoleMode)"
+Write-Log -Level "INFO" -Message "Mode fichier log: $($context.LogFileMode)"
 if ($projectInfo) {
     Write-Log -Level "INFO" -Message "Projet: $($projectInfo.Name)"
     Write-Log -Level "INFO" -Message "Base projet: $($projectInfo.DatabasePath)"

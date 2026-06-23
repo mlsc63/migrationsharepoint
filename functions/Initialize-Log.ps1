@@ -1,6 +1,12 @@
 function Initialize-Log {
     param(
-        [string]$LogDirectory
+        [string]$LogDirectory,
+
+        [ValidateSet("Verbose", "ProgressOnly", "ErrorsOnly", "Quiet")]
+        [string]$ConsoleMode = "Verbose",
+
+        [ValidateSet("Verbose", "ProgressOnly", "ErrorsOnly", "Quiet")]
+        [string]$FileMode = "Verbose"
     )
 
     if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
@@ -16,6 +22,8 @@ function Initialize-Log {
 
     New-Item -ItemType File -Path $LogPath -Force | Out-Null
     $script:LogPath = (Resolve-Path -LiteralPath $LogPath).Path
+    $script:LogConsoleMode = $ConsoleMode
+    $script:LogFileMode = $FileMode
 
     Write-Log -Level "INFO" -Message "Journal initialise: $script:LogPath"
     return $script:LogPath

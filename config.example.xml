@@ -18,6 +18,10 @@
 
     <Logging>
         <LogDirectory>.\logs</LogDirectory>
+        <ConsoleMode>ProgressOnly</ConsoleMode>
+        <FileMode>Verbose</FileMode>
+        <ProgressEveryFiles>1000</ProgressEveryFiles>
+        <ProgressEverySeconds>30</ProgressEverySeconds>
     </Logging>
 
     <Migration>

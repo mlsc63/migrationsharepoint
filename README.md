@@ -82,6 +82,10 @@ La configuration se fait dans `config.xml`.
 
     <Logging>
         <LogDirectory>.\logs</LogDirectory>
+        <ConsoleMode>ProgressOnly</ConsoleMode>
+        <FileMode>Verbose</FileMode>
+        <ProgressEveryFiles>1000</ProgressEveryFiles>
+        <ProgressEverySeconds>30</ProgressEverySeconds>
     </Logging>
 
     <Migration>
@@ -118,6 +122,10 @@ Champs importants:
 - `Destination.Library`: bibliotheque cible. Attention a utiliser le nom attendu dans l'URL SharePoint, par exemple `Shared Documents`.
 - `Destination.Folder`: dossier cible optionnel dans la bibliotheque.
 - `Logging.LogDirectory`: dossier de sortie des journaux.
+- `Logging.ConsoleMode`: niveau d'affichage console. Valeurs: `Verbose`, `ProgressOnly`, `ErrorsOnly`, `Quiet`.
+- `Logging.FileMode`: niveau d'ecriture dans le fichier log. Valeurs: `Verbose`, `ProgressOnly`, `ErrorsOnly`, `Quiet`. Valeur conseillee: `Verbose` pour conserver le detail complet.
+- `Logging.ProgressEveryFiles`: ecrit une progression tous les N fichiers traites pendant la migration projet. `0` desactive ce declencheur.
+- `Logging.ProgressEverySeconds`: ecrit une progression toutes les N secondes pendant la migration projet. `0` desactive ce declencheur.
 - `Migration.HashMode`: mode de detection des modifications locales. Valeurs autorisees: `SHA256`, `Quick`, `None`.
 - `Migration.ParallelInventory`: nombre d'empreintes de fichiers calculees simultanement pour `-Inventory` et `-DeltaInventory`, entre `1` et `16`. Valeur conseillee: `4`.
 - `Migration.MaxAttemptsPerFile`: nombre maximum de tentatives d'upload par fichier. Mettre `0` pour desactiver la limite.
@@ -146,6 +154,31 @@ Lancement standard sans projet:
 Les journaux sont crees dans le dossier configure, par defaut `.\logs`.
 
 Pour une migration repriseable, utiliser le workflow projet decrit ci-dessous.
+
+## Affichage et logs
+
+Pour les gros volumes, l'affichage d'une ligne par fichier peut ralentir la migration et rendre la console difficile a lire. Les modes de log se reglent dans `config.xml`.
+
+Mode conseille pour la production:
+
+```xml
+<Logging>
+    <LogDirectory>.\logs</LogDirectory>
+    <ConsoleMode>ProgressOnly</ConsoleMode>
+    <FileMode>Verbose</FileMode>
+    <ProgressEveryFiles>1000</ProgressEveryFiles>
+    <ProgressEverySeconds>30</ProgressEverySeconds>
+</Logging>
+```
+
+Avec cette configuration, la console affiche les etapes, les erreurs, les avertissements importants, les lignes de progression et le resume final. Le fichier log conserve le detail complet, notamment les `[OK]` fichier par fichier.
+
+Modes disponibles:
+
+- `Verbose`: tout afficher/ecrire, comportement historique.
+- `ProgressOnly`: masque les lignes fichier par fichier comme `[OK]` et `[SKIP]`, garde les etapes, progressions, erreurs et resumes.
+- `ErrorsOnly`: ne garde que les erreurs.
+- `Quiet`: n'affiche ou n'ecrit rien pour la cible concernee.
 
 ## Commandes essentielles
 

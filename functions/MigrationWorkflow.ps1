@@ -51,6 +51,10 @@ function Show-MigrationHelp {
     Write-Host "  Source.LocalPath            Dossier local source."
     Write-Host "  Destination.*               SiteUrl, Library, Folder."
     Write-Host "  Logging.LogDirectory        Dossier des logs."
+    Write-Host "  Logging.ConsoleMode         Verbose, ProgressOnly, ErrorsOnly ou Quiet."
+    Write-Host "  Logging.FileMode            Verbose, ProgressOnly, ErrorsOnly ou Quiet."
+    Write-Host "  Logging.ProgressEveryFiles  Frequence de progression par nombre de fichiers."
+    Write-Host "  Logging.ProgressEverySeconds Frequence de progression par duree."
     Write-Host "  Migration.HashMode          SHA256, Quick ou None."
     Write-Host "  Migration.ParallelInventory Nombre de calculs d'empreinte simultanes. Defaut: 4."
     Write-Host "  Migration.MaxAttemptsPerFile Nombre max de tentatives par fichier. 0 = illimite."
@@ -128,7 +132,35 @@ function Get-MigrationContext {
     $destinationSiteUrl = Get-RequiredValue -Value $destinationNode.SiteUrl -Name "Destination.SiteUrl"
     $destinationLibrary = Get-RequiredValue -Value $destinationNode.Library -Name "Destination.Library"
     $destinationFolder = $destinationNode.Folder
-    $logDirectory = $config.Configuration.Logging.LogDirectory
+    $loggingNode = $config.Configuration.Logging
+    $logDirectory = $loggingNode.LogDirectory
+    $logConsoleMode = "Verbose"
+    $logFileMode = "Verbose"
+    $progressEveryFiles = 1000
+    $progressEverySeconds = 30
+
+    if ($null -ne $loggingNode) {
+        $consoleModeNode = $loggingNode.SelectSingleNode("ConsoleMode")
+        $fileModeNode = $loggingNode.SelectSingleNode("FileMode")
+        $progressEveryFilesNode = $loggingNode.SelectSingleNode("ProgressEveryFiles")
+        $progressEverySecondsNode = $loggingNode.SelectSingleNode("ProgressEverySeconds")
+
+        if ($null -ne $consoleModeNode -and -not [string]::IsNullOrWhiteSpace($consoleModeNode.InnerText)) {
+            $logConsoleMode = "$($consoleModeNode.InnerText)".Trim()
+        }
+
+        if ($null -ne $fileModeNode -and -not [string]::IsNullOrWhiteSpace($fileModeNode.InnerText)) {
+            $logFileMode = "$($fileModeNode.InnerText)".Trim()
+        }
+
+        if ($null -ne $progressEveryFilesNode -and -not [string]::IsNullOrWhiteSpace($progressEveryFilesNode.InnerText)) {
+            $progressEveryFiles = [int]$progressEveryFilesNode.InnerText
+        }
+
+        if ($null -ne $progressEverySecondsNode -and -not [string]::IsNullOrWhiteSpace($progressEverySecondsNode.InnerText)) {
+            $progressEverySeconds = [int]$progressEverySecondsNode.InnerText
+        }
+    }
 
     if (-not [System.IO.Path]::IsPathRooted($sourcePath)) {
         $sourcePath = Join-Path $configDirectory $sourcePath
@@ -214,6 +246,22 @@ function Get-MigrationContext {
         throw "Migration.HashMode invalide: $hashMode. Valeurs autorisees: SHA256, Quick, None."
     }
 
+    if ($logConsoleMode -notin @("Verbose", "ProgressOnly", "ErrorsOnly", "Quiet")) {
+        throw "Logging.ConsoleMode invalide: $logConsoleMode. Valeurs autorisees: Verbose, ProgressOnly, ErrorsOnly, Quiet."
+    }
+
+    if ($logFileMode -notin @("Verbose", "ProgressOnly", "ErrorsOnly", "Quiet")) {
+        throw "Logging.FileMode invalide: $logFileMode. Valeurs autorisees: Verbose, ProgressOnly, ErrorsOnly, Quiet."
+    }
+
+    if ($progressEveryFiles -lt 0) {
+        throw "Logging.ProgressEveryFiles doit etre superieur ou egal a 0."
+    }
+
+    if ($progressEverySeconds -lt 0) {
+        throw "Logging.ProgressEverySeconds doit etre superieur ou egal a 0."
+    }
+
     $exclusionsNode = $config.SelectSingleNode("/Configuration/Exclusions")
     $configExcludeFiles = @()
     $configExcludeFolders = @()
@@ -248,6 +296,10 @@ function Get-MigrationContext {
     return [pscustomobject]@{
         ConfigPath            = $ConfigPath
         LogDirectory          = $logDirectory
+        LogConsoleMode        = $logConsoleMode
+        LogFileMode           = $logFileMode
+        ProgressEveryFiles    = $progressEveryFiles
+        ProgressEverySeconds  = $progressEverySeconds
         TenantId              = $tenantId
         ClientId              = $clientId
         CertificateThumbprint = $certificateThumbprint
@@ -1726,6 +1778,8 @@ function Invoke-ProjectMigration {
         $producerDone = $false
         $currentPage = @()
         $currentPageIndex = 0
+        $lastProgressFileCount = 0
+        $lastProgressLogAt = Get-Date
         $queueCapacity = [Math]::Max($ParallelUploads * 4, $ParallelUploads)
         $workQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new($queueCapacity)
         $resultQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new()
@@ -1769,6 +1823,37 @@ function Invoke-ProjectMigration {
         $script:MigrationSkipped = $skipped
         $script:MigrationFailed = $failed
         $script:MigrationResultHandled = $false
+
+        function Write-MigrationProgressIfNeeded {
+            param(
+                [Parameter(Mandatory)]
+                [int]$ProcessedCount,
+
+                [Parameter(Mandatory)]
+                [int]$TotalCount,
+
+                [switch]$Force
+            )
+
+            if ($TotalCount -le 0 -or $ProcessedCount -le 0) {
+                return
+            }
+
+            $now = Get-Date
+            $fileThresholdReached = $Context.ProgressEveryFiles -gt 0 -and ($ProcessedCount - $script:LastMigrationProgressFileCount) -ge $Context.ProgressEveryFiles
+            $timeThresholdReached = $Context.ProgressEverySeconds -gt 0 -and ($now - $script:LastMigrationProgressLogAt).TotalSeconds -ge $Context.ProgressEverySeconds
+
+            if ($Force -or $ProcessedCount -eq $TotalCount -or $fileThresholdReached -or $timeThresholdReached) {
+                if ($ProcessedCount -ne $script:LastMigrationProgressFileCount -or $Force) {
+                    Write-Log -Level "INFO" -Message "Progression du run: $ProcessedCount/$TotalCount"
+                    $script:LastMigrationProgressFileCount = $ProcessedCount
+                    $script:LastMigrationProgressLogAt = $now
+                }
+            }
+        }
+
+        $script:LastMigrationProgressFileCount = $lastProgressFileCount
+        $script:LastMigrationProgressLogAt = $lastProgressLogAt
 
         try {
             for ($workerId = 1; $workerId -le $ParallelUploads; $workerId++) {
@@ -1846,6 +1931,7 @@ function Invoke-ProjectMigration {
                         }
 
                         $processedFileCount++
+                        Write-MigrationProgressIfNeeded -ProcessedCount $processedFileCount -TotalCount $totalFilesToProcess
                         $madeProgress = $true
                         continue
                     }
@@ -1853,6 +1939,7 @@ function Invoke-ProjectMigration {
                     if ($WhatIf) {
                         Write-Log -Level "INFO" -Message "[WHATIF] $($row.FullPath) -> $($row.TargetUrl) - Taille: $fileSize"
                         $processedFileCount++
+                        Write-MigrationProgressIfNeeded -ProcessedCount $processedFileCount -TotalCount $totalFilesToProcess
                         $madeProgress = $true
                         continue
                     }
@@ -1874,9 +1961,7 @@ function Invoke-ProjectMigration {
                     $processedFileCount++
                     $madeProgress = $true
 
-                    if ($processedFileCount -eq $totalFilesToProcess -or $processedFileCount % $Context.ProcessingBatchSize -eq 0) {
-                        Write-Log -Level "INFO" -Message "Progression du run: $processedFileCount/$totalFilesToProcess"
-                    }
+                    Write-MigrationProgressIfNeeded -ProcessedCount $processedFileCount -TotalCount $totalFilesToProcess
 
                     if ($maxTotalErrors -gt 0 -and $script:MigrationFailed -ge $maxTotalErrors) {
                         throw "Seuil d'erreurs atteint ($script:MigrationFailed/$maxTotalErrors). Arret de la migration."
@@ -1913,9 +1998,7 @@ function Invoke-ProjectMigration {
             $failed = $script:MigrationFailed
         }
 
-        if ($processedFileCount -gt 0 -and $processedFileCount % $Context.ProcessingBatchSize -ne 0) {
-            Write-Log -Level "INFO" -Message "Progression du run: $processedFileCount/$totalFilesToProcess"
-        }
+        Write-MigrationProgressIfNeeded -ProcessedCount $processedFileCount -TotalCount $totalFilesToProcess -Force
 
         foreach ($row in $remoteDeleteCandidates) {
             $currentOperation = "Suppression du fichier distant"

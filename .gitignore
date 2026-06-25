@@ -4,6 +4,7 @@ projects/
 
 # Local configuration with tenant/client/certificate values
 config.xml
+verif.ps1
 
 # PowerShell/system noise
 *.log
@@ -15,4 +16,3 @@ Desktop.ini
 *.db
 *.db-shm
 *.db-wal
-

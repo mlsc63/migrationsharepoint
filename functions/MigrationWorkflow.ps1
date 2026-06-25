@@ -42,7 +42,7 @@ function Show-MigrationHelp {
     Write-Host "  -Overwrite                  Supprime le fichier cible existant puis upload."
     Write-Host "  -ParallelUploads <1-16>    Nombre d'uploads simultanes. 0 = valeur XML."
     Write-Host "  -MaxFiles <n>              Limite le nombre de fichiers traites avec -Migrate ou -Resume. 0 = illimite."
-    Write-Host "  -AssumeDestinationEmpty    Ignore le controle d'existence distant avant upload."
+    Write-Host "  -AssumeDestinationEmpty    Ignore le chargement du cache des fichiers distants."
     Write-Host "  -ExcludeFile <patterns>     Exclut des fichiers, ex: *.tmp,Thumbs.db."
     Write-Host "  -ExcludeFolder <patterns>   Exclut des dossiers, ex: node_modules,archive/*."
     Write-Host ""
@@ -61,7 +61,7 @@ function Show-MigrationHelp {
     Write-Host "  Migration.MaxTotalErrors    Nombre max d'erreurs par execution. 0 = illimite."
     Write-Host "  Migration.ParallelUploads   Nombre d'uploads simultanes. Defaut: 4."
     Write-Host "  Migration.IncludeHiddenItems Inclut les fichiers caches/systeme dans l'inventaire."
-    Write-Host "  Migration.AssumeDestinationEmpty Ignore Get-PnPFile avant chaque upload."
+    Write-Host "  Migration.AssumeDestinationEmpty Ignore le cache des fichiers distants."
     Write-Host "  Migration.TreatTenantSyncExclusionsAsBlocked Politique optionnelle de compatibilite OneDrive."
     Write-Host "  Migration.ProcessingBatchSize Nombre de lignes SQLite chargees par page."
     Write-Host "  Exclusions.*                Motifs de fichiers/dossiers a ignorer."
@@ -1383,6 +1383,136 @@ function Invoke-ParallelMigrationUploads {
     } -ThrottleLimit $ThrottleLimit
 }
 
+function Initialize-MigrationSharePointCaches {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$ProjectInfo,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Folders,
+
+        [int]$MaxTotalErrors = 1000
+    )
+
+    $folderCache = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $remoteFileCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $folderLocks = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $rootFolder = $Context.Destination.ServerRelativeRoot.TrimEnd("/")
+    $sitePath = ([uri]$Context.Destination.SiteUrl).AbsolutePath.TrimEnd("/")
+    $preparedCount = 0
+    $createdCount = 0
+    $failedCount = 0
+    $listedFileCount = 0
+    $failedFolders = [System.Collections.Generic.List[object]]::new()
+
+    [void]$folderCache.TryAdd($rootFolder, $true)
+
+    foreach ($folderRow in $Folders) {
+        $targetFolder = "$($folderRow.TargetFolder)".TrimEnd("/")
+
+        try {
+            if ($targetFolder -ne $rootFolder -and -not $targetFolder.StartsWith("$rootFolder/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Chemin SharePoint invalide: $targetFolder"
+            }
+
+            $currentFolder = $rootFolder
+            $relativeFolder = $targetFolder.Substring($rootFolder.Length).Trim("/")
+            $parts = @($relativeFolder -split "/" | Where-Object { $_ })
+
+            foreach ($part in $parts) {
+                $parentFolder = $currentFolder
+                $currentFolder = "$currentFolder/$part"
+
+                if ($folderCache.ContainsKey($currentFolder)) {
+                    continue
+                }
+
+                try {
+                    Get-PnPFolder -Url $currentFolder -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
+                        throw
+                    }
+
+                    Add-PnPFolder -Name $part -Folder $parentFolder -ErrorAction Stop | Out-Null
+                    Get-PnPFolder -Url $currentFolder -ErrorAction Stop | Out-Null
+                    $createdCount++
+                }
+
+                [void]$folderCache.TryAdd($currentFolder, $true)
+            }
+
+            Update-MigrationFolderStatus `
+                -DatabasePath $ProjectInfo.DatabasePath `
+                -TargetFolder $targetFolder `
+                -Status "Ready" `
+                -LastError "" `
+                -IncrementAttempt
+            $preparedCount++
+
+            $siteRelativeFolder = if ([string]::IsNullOrWhiteSpace($sitePath)) {
+                $targetFolder.TrimStart("/")
+            }
+            else {
+                $targetFolder.Substring($sitePath.Length).TrimStart("/")
+            }
+
+            try {
+                $remoteFiles = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($item in @(Get-PnPFolderItem -FolderSiteRelativeUrl $siteRelativeFolder -ItemType File -ErrorAction Stop)) {
+                    if (-not [string]::IsNullOrWhiteSpace("$($item.Name)")) {
+                        [void]$remoteFiles.TryAdd("$($item.Name)", $true)
+                        $listedFileCount++
+                    }
+                }
+                [void]$remoteFileCache.TryAdd($targetFolder, $remoteFiles)
+            }
+            catch {
+                Write-Log -Level "WARN" -Message "[CACHE] Lecture distante impossible pour $targetFolder; verification fichier par fichier conservee: $($_.Exception.Message)"
+            }
+        }
+        catch {
+            $failedCount++
+            $message = $_.Exception.Message
+            Update-MigrationFolderStatus `
+                -DatabasePath $ProjectInfo.DatabasePath `
+                -TargetFolder $targetFolder `
+                -Status "Failed" `
+                -LastError $message `
+                -IncrementAttempt
+            $failedFolders.Add([pscustomobject]@{
+                TargetFolder = $targetFolder
+                LastError    = $message
+            })
+            Write-Log -Level "ERROR" -Message "[DOSSIER] Preparation impossible: $targetFolder - $message"
+
+            if ($MaxTotalErrors -gt 0 -and $failedCount -ge $MaxTotalErrors) {
+                throw "Seuil d'erreurs atteint pendant la preparation des dossiers ($failedCount/$MaxTotalErrors)."
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        FolderCache      = $folderCache
+        RemoteFileCache  = $remoteFileCache
+        FolderLocks      = $folderLocks
+        PreparedCount    = $preparedCount
+        CreatedCount     = $createdCount
+        FailedCount      = $failedCount
+        FailedFolders    = $failedFolders.ToArray()
+        ListedFileCount  = $listedFileCount
+    }
+}
+
 function Start-MigrationUploadWorker {
     param(
         [Parameter(Mandatory)]
@@ -1395,10 +1525,16 @@ function Start-MigrationUploadWorker {
         [pscustomobject]$Context,
 
         [Parameter(Mandatory)]
-        [string]$DatabasePath,
+        [int]$WorkerId,
 
         [Parameter(Mandatory)]
-        [int]$WorkerId,
+        [object]$FolderCache,
+
+        [Parameter(Mandatory)]
+        [object]$RemoteFileCache,
+
+        [Parameter(Mandatory)]
+        [object]$FolderLocks,
 
         [int]$MaxAttemptsPerFile = 3,
 
@@ -1411,7 +1547,9 @@ function Start-MigrationUploadWorker {
         $WorkQueue,
         $ResultQueue,
         $Context,
-        $DatabasePath,
+        $FolderCache,
+        $RemoteFileCache,
+        $FolderLocks,
         [bool]$Overwrite,
         [bool]$AssumeDestinationEmpty,
         $MaxAttemptsPerFile
@@ -1420,7 +1558,9 @@ function Start-MigrationUploadWorker {
             $Queue,
             $Results,
             $WorkerContext,
-            $WorkerDatabasePath,
+            $WorkerFolderCache,
+            $WorkerRemoteFileCache,
+            $WorkerFolderLocks,
             [bool]$WorkerOverwrite,
             [bool]$WorkerAssumeDestinationEmpty,
             [int]$WorkerMaxAttempts
@@ -1573,6 +1713,95 @@ function Start-MigrationUploadWorker {
             }
         }
 
+        function Ensure-WorkerFolder {
+            param(
+                [Parameter(Mandatory)]
+                [string]$TargetFolder,
+
+                [Parameter(Mandatory)]
+                [string]$RootFolder,
+
+                [Parameter(Mandatory)]
+                $Connection,
+
+                [Parameter(Mandatory)]
+                $FolderCache,
+
+                [Parameter(Mandatory)]
+                $FolderLocks,
+
+                [switch]$Force
+            )
+
+            $normalizedTarget = $TargetFolder.TrimEnd("/")
+            $folderLock = $null
+            if (-not $FolderLocks.TryGetValue($normalizedTarget, [ref]$folderLock)) {
+                $newFolderLock = [System.Threading.SemaphoreSlim]::new(1, 1)
+                if ($FolderLocks.TryAdd($normalizedTarget, $newFolderLock)) {
+                    $folderLock = $newFolderLock
+                }
+                else {
+                    $newFolderLock.Dispose()
+                    [void]$FolderLocks.TryGetValue($normalizedTarget, [ref]$folderLock)
+                }
+            }
+
+            $folderLock.Wait()
+            try {
+                if (-not $Force -and $FolderCache.ContainsKey($normalizedTarget)) {
+                    return $false
+                }
+
+                if ($normalizedTarget -ne $RootFolder -and -not $normalizedTarget.StartsWith("$RootFolder/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Chemin SharePoint invalide: $normalizedTarget"
+                }
+
+                $createdFolder = $false
+                $currentFolder = $RootFolder
+                if ($Force) {
+                    Get-PnPFolderWithRetry -Url $currentFolder -Connection $Connection
+                }
+                else {
+                    [void]$FolderCache.TryAdd($currentFolder, $true)
+                }
+
+                $relativeFolder = $normalizedTarget.Substring($RootFolder.Length).Trim("/")
+                $parts = @($relativeFolder -split "/" | Where-Object { $_ })
+
+                foreach ($part in $parts) {
+                    $parentFolder = $currentFolder
+                    $currentFolder = "$currentFolder/$part"
+
+                    if (-not $Force -and $FolderCache.ContainsKey($currentFolder)) {
+                        continue
+                    }
+
+                    try {
+                        Get-PnPFolderWithRetry -Url $currentFolder -Connection $Connection
+                    }
+                    catch {
+                        if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
+                            throw "Verification du dossier SharePoint impossible: $currentFolder - $($_.Exception.Message)"
+                        }
+
+                        Add-PnPFolderWithRetry `
+                            -Name $part `
+                            -Folder $parentFolder `
+                            -Url $currentFolder `
+                            -Connection $Connection
+                        $createdFolder = $true
+                    }
+
+                    [void]$FolderCache.TryAdd($currentFolder, $true)
+                }
+
+                return $createdFolder
+            }
+            finally {
+                [void]$folderLock.Release()
+            }
+        }
+
         $connection = $null
         $siteUrl = $WorkerContext.Destination.SiteUrl
         $tenantId = $WorkerContext.TenantId
@@ -1589,7 +1818,6 @@ function Start-MigrationUploadWorker {
             try {
                 if ($null -eq $connection) {
                     Import-Module PnP.PowerShell -ErrorAction Stop
-                    Import-Module PSSQLite -ErrorAction Stop
                     $connection = Connect-PnPOnlineWithRetry `
                         -Url $siteUrl `
                         -Tenant $tenantId `
@@ -1599,46 +1827,35 @@ function Start-MigrationUploadWorker {
 
                 $operation = "Creation/verification du dossier SharePoint"
                 $targetFolder = "$($row.TargetFolder)".TrimEnd("/")
-                if ($targetFolder -ne $rootFolder -and -not $targetFolder.StartsWith("$rootFolder/", [System.StringComparison]::OrdinalIgnoreCase)) {
-                    throw "Chemin SharePoint invalide: $($row.TargetFolder)"
-                }
-
-                $currentFolder = $rootFolder
-                Get-PnPFolderWithRetry -Url $currentFolder -Connection $connection
-                $relativeFolder = $targetFolder.Substring($rootFolder.Length).Trim("/")
-                $parts = @($relativeFolder -split "/" | Where-Object { $_ })
-
-                for ($i = 0; $i -lt $parts.Count; $i++) {
-                    $parentFolder = $currentFolder
-                    $currentFolder = "$currentFolder/$($parts[$i])"
-
-                    try {
-                        Get-PnPFolderWithRetry -Url $currentFolder -Connection $connection
-                    }
-                    catch {
-                        if (-not (Test-PnPNotFoundError -ErrorRecord $_)) {
-                            throw "Verification du dossier SharePoint impossible: $currentFolder - $($_.Exception.Message)"
-                        }
-
-                        Add-PnPFolderWithRetry -Name $parts[$i] -Folder $parentFolder -Url $currentFolder -Connection $connection
-                    }
-                }
+                Ensure-WorkerFolder `
+                    -TargetFolder $targetFolder `
+                    -RootFolder $rootFolder `
+                    -Connection $connection `
+                    -FolderCache $WorkerFolderCache `
+                    -FolderLocks $WorkerFolderLocks
 
                 $operation = "Verification de l'existence du fichier SharePoint"
                 $fileExists = $false
                 $mustCheckExistence = (-not $WorkerAssumeDestinationEmpty) -or $isInterruptedUpload
+                $fileName = [System.IO.Path]::GetFileName("$($row.TargetUrl)")
 
                 if ($mustCheckExistence) {
-                    try {
-                        Get-PnPFile -Url $row.TargetUrl -Connection $connection -ErrorAction Stop | Out-Null
-                        $fileExists = $true
+                    $cachedFiles = $null
+                    if ($WorkerRemoteFileCache.TryGetValue($targetFolder, [ref]$cachedFiles)) {
+                        $fileExists = $cachedFiles.ContainsKey($fileName)
                     }
-                    catch {
-                        if (Test-PnPNotFoundError -ErrorRecord $_) {
-                            $fileExists = $false
+                    else {
+                        try {
+                            Get-PnPFile -Url $row.TargetUrl -Connection $connection -ErrorAction Stop | Out-Null
+                            $fileExists = $true
                         }
-                        else {
-                            throw
+                        catch {
+                            if (Test-PnPNotFoundError -ErrorRecord $_) {
+                                $fileExists = $false
+                            }
+                            else {
+                                throw
+                            }
                         }
                     }
                 }
@@ -1669,12 +1886,6 @@ function Start-MigrationUploadWorker {
                     continue
                 }
 
-                $operation = "Initialisation de la tentative SQLite"
-                $now = (Get-Date).ToUniversalTime().ToString("o")
-                Invoke-SqliteQuery `
-                    -DataSource $WorkerDatabasePath `
-                    -Query "PRAGMA busy_timeout=30000; UPDATE Files SET Status = 'Uploading', LastError = '', UpdatedAt = @UpdatedAt, AttemptCount = AttemptCount + 1 WHERE Id = @Id;" `
-                    -SqlParameters @{ UpdatedAt = $now; Id = [int]$row.Id } | Out-Null
                 $attemptStarted = $true
                 $newAttemptStarted = $true
 
@@ -1684,7 +1895,46 @@ function Start-MigrationUploadWorker {
                 }
 
                 $operation = "Upload du fichier vers SharePoint"
-                Add-PnPFile -Path $row.FullPath -Folder $row.TargetFolder -Connection $connection -ErrorAction Stop | Out-Null
+                $folderRecovered = $false
+                try {
+                    Add-PnPFile -Path $row.FullPath -Folder $row.TargetFolder -Connection $connection -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    $uploadError = $_
+                    $folderIsMissing = Test-PnPNotFoundError -ErrorRecord $uploadError
+
+                    if (-not $folderIsMissing) {
+                        try {
+                            Get-PnPFolderWithRetry -Url $targetFolder -Connection $connection -MaxAttempts 1
+                        }
+                        catch {
+                            $folderIsMissing = Test-PnPNotFoundError -ErrorRecord $_
+                        }
+                    }
+
+                    if (-not $folderIsMissing) {
+                        throw $uploadError
+                    }
+
+                    $operation = "Recreation du dossier SharePoint apres echec d'upload"
+                    $removedFolderValue = $false
+                    [void]$WorkerFolderCache.TryRemove($targetFolder, [ref]$removedFolderValue)
+                    $folderRecovered = Ensure-WorkerFolder `
+                        -TargetFolder $targetFolder `
+                        -RootFolder $rootFolder `
+                        -Connection $connection `
+                        -FolderCache $WorkerFolderCache `
+                        -FolderLocks $WorkerFolderLocks `
+                        -Force
+
+                    $operation = "Nouvelle tentative d'upload apres recreation du dossier"
+                    Add-PnPFile -Path $row.FullPath -Folder $row.TargetFolder -Connection $connection -ErrorAction Stop | Out-Null
+                }
+
+                $cachedFiles = $null
+                if ($WorkerRemoteFileCache.TryGetValue($targetFolder, [ref]$cachedFiles)) {
+                    [void]$cachedFiles.TryAdd($fileName, $true)
+                }
 
                 $Results.Add([pscustomobject]@{
                     Id             = [int]$row.Id
@@ -1694,6 +1944,8 @@ function Start-MigrationUploadWorker {
                     Status         = "Uploaded"
                     Message        = ""
                     AttemptStarted = $attemptStarted
+                    TargetFolder   = $targetFolder
+                    FolderRecovered = $folderRecovered
                 })
             }
             catch {
@@ -1705,6 +1957,8 @@ function Start-MigrationUploadWorker {
                     Status         = if ($isInterruptedUpload -and -not $newAttemptStarted) { "RetryUncertain" } else { "Failed" }
                     Message        = "Operation: $operation - Cible: $($row.TargetUrl) - $($_.Exception.Message)"
                     AttemptStarted = $attemptStarted
+                    TargetFolder   = "$($row.TargetFolder)".TrimEnd("/")
+                    FolderRecovered = $false
                 })
             }
         }
@@ -1740,6 +1994,7 @@ function Invoke-ProjectMigration {
     }
 
     Reset-IncompleteUploads -DatabasePath $ProjectInfo.DatabasePath
+    Sync-MigrationFolders -DatabasePath $ProjectInfo.DatabasePath
     $availableFilesToProcess = Get-MigrationFilesToProcessCount `
         -DatabasePath $ProjectInfo.DatabasePath `
         -IncludeFailed:$IncludeFailed `
@@ -1760,11 +2015,63 @@ function Invoke-ProjectMigration {
     }
     $runMode = if ($IncludeFailed) { "Resume" } else { "Migrate" }
     $runId = Start-MigrationRun -DatabasePath $ProjectInfo.DatabasePath -Mode $runMode
+    $foldersToPrepare = @(Get-MigrationFoldersToPrepare `
+            -DatabasePath $ProjectInfo.DatabasePath `
+            -IncludeFailed:$IncludeFailed `
+            -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
+            -MaxFiles $MaxFiles)
+    $sharePointCaches = if ($WhatIf) {
+        $folderCache = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        $remoteFileCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        $folderLocks = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        [void]$folderCache.TryAdd($Context.Destination.ServerRelativeRoot.TrimEnd("/"), $true)
+
+        [pscustomobject]@{
+            FolderCache     = $folderCache
+            RemoteFileCache = $remoteFileCache
+            FolderLocks     = $folderLocks
+            PreparedCount   = 0
+            CreatedCount    = 0
+            FailedCount     = 0
+            FailedFolders   = @()
+            ListedFileCount = 0
+        }
+    }
+    else {
+        Write-Step "$($foldersToPrepare.Count) dossier(s) SharePoint a preparer"
+        Initialize-MigrationSharePointCaches `
+            -ProjectInfo $ProjectInfo `
+            -Context $Context `
+            -Folders $foldersToPrepare `
+            -MaxTotalErrors $Context.MaxTotalErrors
+    }
+
+    $folderFailedFiles = 0
+    foreach ($failedFolder in @($sharePointCaches.FailedFolders)) {
+        $folderFailedFiles += Set-MigrationFilesFailedForFolder `
+            -DatabasePath $ProjectInfo.DatabasePath `
+            -TargetFolder $failedFolder.TargetFolder `
+            -LastError "Preparation du dossier SharePoint impossible: $($failedFolder.LastError)"
+    }
+
+    $availableFilesToProcess = Get-MigrationFilesToProcessCount `
+        -DatabasePath $ProjectInfo.DatabasePath `
+        -IncludeFailed:$IncludeFailed `
+        -MaxAttemptsPerFile $Context.MaxAttemptsPerFile
+    $totalFilesToProcess = if ($MaxFiles -gt 0) {
+        [Math]::Min($availableFilesToProcess, $MaxFiles)
+    }
+    else {
+        $availableFilesToProcess
+    }
 
     $uploaded = 0
     $skipped = 0
     $deletedRemote = 0
-    $failed = 0
+    $failed = $folderFailedFiles
     $maxTotalErrors = [int]$Context.MaxTotalErrors
 
     try {
@@ -1781,8 +2088,16 @@ function Invoke-ProjectMigration {
         }
         Write-Log -Level "INFO" -Message "Taille des pages SQLite: $($Context.ProcessingBatchSize)"
         Write-Log -Level "INFO" -Message "Controle d'existence distant ignore: $AssumeDestinationEmpty"
+        Write-Log -Level "INFO" -Message "Dossiers prepares: $($sharePointCaches.PreparedCount); crees: $($sharePointCaches.CreatedCount); echecs: $($sharePointCaches.FailedCount)"
+        if ($folderFailedFiles -gt 0) {
+            Write-Log -Level "ERROR" -Message "Fichiers bloques par un dossier en erreur: $folderFailedFiles"
+        }
+        Write-Log -Level "INFO" -Message "Fichiers distants charges dans le cache: $($sharePointCaches.ListedFileCount)"
         if ($AssumeDestinationEmpty) {
             Write-Log -Level "WARN" -Message "Le mode AssumeDestinationEmpty peut ecraser un fichier distant non reference dans la base projet."
+        }
+        if ($maxTotalErrors -gt 0 -and $failed -ge $maxTotalErrors) {
+            throw "Seuil d'erreurs atteint pendant la preparation des dossiers ($failed/$maxTotalErrors fichiers bloques)."
         }
 
         if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -1816,6 +2131,15 @@ function Invoke-ProjectMigration {
             switch ($Result.Status) {
                 "Uploaded" {
                     Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "Uploaded" -LastError "" -IncrementAttempt:$incrementAttempt -SetUploadedAt
+                    $folderRecoveredProperty = $Result.PSObject.Properties["FolderRecovered"]
+                    if ($null -ne $folderRecoveredProperty -and [bool]$folderRecoveredProperty.Value) {
+                        Update-MigrationFolderStatus `
+                            -DatabasePath $ProjectInfo.DatabasePath `
+                            -TargetFolder $Result.TargetFolder `
+                            -Status "Ready" `
+                            -LastError ""
+                        Write-Log -Level "WARN" -Message "[DOSSIER] Dossier recree pendant l'upload: $($Result.TargetFolder)"
+                    }
                     Write-Log -Level "SUCCESS" -Message "[OK] $($Result.RelativePath) - Cible: $($Result.TargetUrl) - Taille: $fileSize"
                     $script:MigrationUploaded++
                 }
@@ -1831,6 +2155,14 @@ function Invoke-ProjectMigration {
                 }
                 default {
                     Update-MigrationFileStatus -DatabasePath $ProjectInfo.DatabasePath -Id $Result.Id -Status "Failed" -LastError $Result.Message -IncrementAttempt:$incrementAttempt
+                    if ($Result.Message -match "Recreation du dossier SharePoint|Creation/verification du dossier SharePoint") {
+                        Update-MigrationFolderStatus `
+                            -DatabasePath $ProjectInfo.DatabasePath `
+                            -TargetFolder $Result.TargetFolder `
+                            -Status "Failed" `
+                            -LastError $Result.Message `
+                            -IncrementAttempt
+                    }
                     Write-Log -Level "ERROR" -Message "[ERREUR] $($Result.RelativePath) - Taille: $fileSize - $($Result.Message)"
                     $script:MigrationFailed++
                 }
@@ -1879,8 +2211,10 @@ function Invoke-ProjectMigration {
                     -WorkQueue $workQueue `
                     -ResultQueue $resultQueue `
                     -Context $Context `
-                    -DatabasePath $ProjectInfo.DatabasePath `
                     -WorkerId $workerId `
+                    -FolderCache $sharePointCaches.FolderCache `
+                    -RemoteFileCache $sharePointCaches.RemoteFileCache `
+                    -FolderLocks $sharePointCaches.FolderLocks `
                     -MaxAttemptsPerFile $Context.MaxAttemptsPerFile `
                     -Overwrite:$Overwrite `
                     -AssumeDestinationEmpty:$AssumeDestinationEmpty
@@ -1962,14 +2296,19 @@ function Invoke-ProjectMigration {
                         continue
                     }
 
-                    if ($workQueue.TryAdd($row, 100)) {
-                        $enqueuedUploads++
-                        $madeProgress = $true
+                    $isInterruptedUpload = "$($row.Status)" -eq "Uploading"
+                    if (-not $isInterruptedUpload) {
+                        Update-MigrationFileStatus `
+                            -DatabasePath $ProjectInfo.DatabasePath `
+                            -Id $row.Id `
+                            -Status "Uploading" `
+                            -LastError "" `
+                            -IncrementAttempt
                     }
-                    else {
-                        $currentPageIndex--
-                        break
-                    }
+
+                    $workQueue.Add($row)
+                    $enqueuedUploads++
+                    $madeProgress = $true
                 }
 
                 $result = $null

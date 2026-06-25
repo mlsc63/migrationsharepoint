@@ -132,7 +132,7 @@ Champs importants:
 - `Migration.MaxAttemptsPerFile`: nombre maximum de tentatives d'upload par fichier. Mettre `0` pour desactiver la limite.
 - `Migration.MaxTotalErrors`: nombre maximum d'erreurs pendant une execution de migration. Mettre `0` pour desactiver l'arret automatique.
 - `Migration.ParallelUploads`: nombre d'uploads simultanes, entre `1` et `16`. Commencer avec `4`.
-- `Migration.AssumeDestinationEmpty`: si `true`, ne controle pas l'existence distante avant chaque upload.
+- `Migration.AssumeDestinationEmpty`: si `true`, ignore aussi le chargement de l'inventaire distant. Si `false`, le script charge une fois les fichiers de chaque dossier cible et utilise ce cache pendant le run.
 - `Migration.TreatTenantSyncExclusionsAsBlocked`: si `true`, traite les extensions exclues de la synchronisation OneDrive comme non migrables. Ces restrictions ne sont pas des interdictions d'upload SharePoint; l'option est desactivee par defaut et exige des droits d'administration tenant pendant l'inventaire.
 - `Migration.IncludeHiddenItems`: si `true`, l'inventaire, le delta et le controle de changements utilisent aussi les fichiers caches/systeme. Les dossiers vides ne sont pas inventories comme elements separes.
 - `Migration.ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. Defaut: `1000`.
@@ -417,6 +417,8 @@ Un verrou exclusif `migration.lock` empeche deux inventaires, migrations ou expo
 
 Les fichiers d'un inventaire sont prepares avant toute modification de la table `Files`, puis appliques dans une transaction SQLite unique. Une erreur annule donc l'ensemble des changements de cet inventaire. L'application en base reutilise des commandes SQLite preparees et journalise la progression par lots `ProcessingBatchSize`.
 
+Avant les uploads, le script extrait les dossiers cibles uniques, cree les dossiers manquants et charge une fois leur liste de fichiers distants. Les workers partagent ensuite ces caches. Si un dossier disparait entre cette preparation et un upload, son absence est verifiee, le dossier est recree sous verrou, puis l'upload est retente une fois.
+
 ## Base de donnees projet
 
 Chaque projet contient une base SQLite:
@@ -491,6 +493,19 @@ Modes de hash:
 - `SHA256`: le plus fiable, lit le contenu complet du fichier.
 - `Quick`: plus rapide, base la detection sur la taille et la date de derniere modification UTC.
 - `None`: ne calcule pas de hash. La detection fine des modifications locales est desactivee.
+
+### Table `Folders`
+
+Suit la preparation des dossiers SharePoint. Une ligne correspond a un dossier cible unique.
+
+- `TargetFolder`: chemin serveur-relatif du dossier SharePoint.
+- `Status`: `Pending`, `Ready` ou `Failed`.
+- `AttemptCount`: nombre de preparations ou reparations tentees.
+- `LastError`: derniere erreur de creation ou de verification.
+- `UpdatedAt`: date de derniere mise a jour.
+- `ReadyAt`: date de derniere validation reussie.
+
+Une erreur sur un dossier est enregistree une seule fois pendant la preparation. Les fichiers de ce dossier passent en `Failed` sans repeter la meme creation pour chaque fichier. Un prochain `-Resume` retente d'abord le dossier; s'il redevient `Ready`, les fichiers peuvent repartir. La creation de secours reste active lorsqu'un dossier disparait apres une preparation reussie.
 
 ### Table `Runs`
 
@@ -695,7 +710,7 @@ Les limites de migration sont configurees dans le `config.xml` du projet:
 - `MaxAttemptsPerFile`: un fichier dont `AttemptCount` atteint cette valeur n'est plus rejoue. Un fichier `Uploading` reste toutefois controle a distance une derniere fois pour reconcilier un upload incertain.
 - `MaxTotalErrors`: si ce nombre d'erreurs est atteint pendant une execution, la migration s'arrete.
 - `ParallelUploads`: nombre d'uploads executes simultanement. Augmenter progressivement pour surveiller le throttling SharePoint.
-- `AssumeDestinationEmpty`: supprime un appel distant par fichier, mais peut ecraser un fichier SharePoint non reference dans SQLite.
+- `AssumeDestinationEmpty`: si `false`, charge une fois la liste distante de chaque dossier et verifie ensuite les noms dans un cache partage. Si `true`, ce chargement est ignore et un fichier distant externe a SQLite peut etre ecrase.
 - `TreatTenantSyncExclusionsAsBlocked`: transforme explicitement les exclusions de synchronisation OneDrive en blocages de migration. Cette option ne decrit pas les restrictions natives d'upload SharePoint.
 - `IncludeHiddenItems`: inclut les fichiers caches/systeme dans `-Inventory`, `-DeltaInventory` et `-CheckChanges`. Laisser `false` pour garder le comportement PowerShell standard.
 - `ProcessingBatchSize`: taille des lots de hash et des pages de migration SQLite. L'enumeration locale complete reste chargee en memoire. `1000` convient a la plupart des migrations.
@@ -771,6 +786,9 @@ Pour l'upload:
 
 - `ParallelUploads` augmente le nombre d'uploads simultanes;
 - augmenter progressivement pour surveiller le throttling SharePoint;
+- les dossiers uniques sont prepares une fois avant le lancement des workers;
+- avec `AssumeDestinationEmpty=false`, une liste distante est chargee une fois par dossier au lieu d'un `Get-PnPFile` par fichier;
+- un dossier supprime pendant le run est recree par un seul worker, puis l'upload est retente une fois;
 - utiliser `-MaxFiles` pour valider un lot avant une reprise complete.
 
 ### Reprise apres crash
@@ -785,7 +803,9 @@ Les fichiers restes en `Uploading` sont toujours reconciles a distance avant tou
 
 ### Destination supposee vide
 
-`AssumeDestinationEmpty=true` evite un controle distant par fichier et accelere la migration, mais le script ne verifie plus chaque cible avant upload. A utiliser uniquement si la bibliotheque cible ne contient pas de fichiers externes au projet.
+`AssumeDestinationEmpty=false` est le mode recommande: le script charge une fois les noms distants de chaque dossier cible et les partage entre les workers.
+
+`AssumeDestinationEmpty=true` ignore ce cache distant. Il peut accelerer une destination reellement vide, mais le script ne detecte plus les fichiers externes deja presents avant upload.
 
 ## Precautions
 

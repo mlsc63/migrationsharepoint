@@ -159,6 +159,17 @@ CREATE TABLE IF NOT EXISTS Files (
 CREATE INDEX IF NOT EXISTS IX_Files_Status ON Files(Status);
 CREATE INDEX IF NOT EXISTS IX_Files_RelativePath ON Files(RelativePath);
 
+CREATE TABLE IF NOT EXISTS Folders (
+    TargetFolder TEXT PRIMARY KEY,
+    Status TEXT NOT NULL,
+    AttemptCount INTEGER NOT NULL DEFAULT 0,
+    LastError TEXT,
+    UpdatedAt TEXT NOT NULL,
+    ReadyAt TEXT
+);
+
+CREATE INDEX IF NOT EXISTS IX_Folders_Status ON Folders(Status);
+
 CREATE TABLE IF NOT EXISTS Runs (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Mode TEXT NOT NULL,
@@ -409,6 +420,138 @@ function Reset-MigrationHashChanges {
     }
 
     Invoke-SqliteQuery @queryParameters | Out-Null
+}
+
+function Sync-MigrationFolders {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath
+    )
+
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query @"
+INSERT INTO Folders (TargetFolder, Status, AttemptCount, LastError, UpdatedAt, ReadyAt)
+SELECT DISTINCT TargetFolder, 'Pending', 0, '', @UpdatedAt, NULL
+FROM Files
+WHERE TargetFolder IS NOT NULL AND TargetFolder <> ''
+ON CONFLICT(TargetFolder) DO NOTHING;
+"@ `
+        -SqlParameters @{ UpdatedAt = $now } | Out-Null
+}
+
+function Get-MigrationFoldersToPrepare {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [switch]$IncludeFailed,
+
+        [int]$MaxAttemptsPerFile = 3,
+
+        [int]$MaxFiles = 0
+    )
+
+    $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (Status = 'Uploading' OR AttemptCount < @MaxAttemptsPerFile)" } else { "" }
+    $limitClause = if ($MaxFiles -gt 0) { "LIMIT @MaxFiles" } else { "" }
+
+    return @(Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query @"
+SELECT DISTINCT TargetFolder
+FROM (
+    SELECT TargetFolder
+    FROM Files
+    WHERE Status IN $statusFilter
+      $attemptFilter
+    ORDER BY Id
+    $limitClause
+)
+ORDER BY TargetFolder;
+"@ `
+        -SqlParameters @{
+            MaxAttemptsPerFile = $MaxAttemptsPerFile
+            MaxFiles           = $MaxFiles
+        } `
+        -As "PSObject")
+}
+
+function Update-MigrationFolderStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [string]$TargetFolder,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("Pending", "Ready", "Failed")]
+        [string]$Status,
+
+        [string]$LastError,
+
+        [switch]$IncrementAttempt
+    )
+
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    $readyAt = if ($Status -eq "Ready") { $now } else { $null }
+
+    Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query @"
+INSERT INTO Folders (TargetFolder, Status, AttemptCount, LastError, UpdatedAt, ReadyAt)
+VALUES (@TargetFolder, @Status, @AttemptIncrement, @LastError, @UpdatedAt, @ReadyAt)
+ON CONFLICT(TargetFolder) DO UPDATE SET
+    Status = excluded.Status,
+    AttemptCount = Folders.AttemptCount + @AttemptIncrement,
+    LastError = excluded.LastError,
+    UpdatedAt = excluded.UpdatedAt,
+    ReadyAt = CASE WHEN excluded.ReadyAt IS NULL THEN Folders.ReadyAt ELSE excluded.ReadyAt END;
+"@ `
+        -SqlParameters @{
+            TargetFolder    = $TargetFolder
+            Status          = $Status
+            AttemptIncrement = if ($IncrementAttempt) { 1 } else { 0 }
+            LastError       = "$LastError"
+            UpdatedAt       = $now
+            ReadyAt         = $readyAt
+        } | Out-Null
+}
+
+function Set-MigrationFilesFailedForFolder {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DatabasePath,
+
+        [Parameter(Mandatory)]
+        [string]$TargetFolder,
+
+        [Parameter(Mandatory)]
+        [string]$LastError
+    )
+
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    return [int](Invoke-SqliteQuery `
+        -DataSource $DatabasePath `
+        -Query @"
+UPDATE Files
+SET Status = 'Failed',
+    AttemptCount = AttemptCount + 1,
+    LastError = @LastError,
+    UpdatedAt = @UpdatedAt
+WHERE TargetFolder = @TargetFolder
+  AND Status IN ('Pending', 'Failed', 'Uploading');
+
+SELECT changes();
+"@ `
+        -SqlParameters @{
+            TargetFolder = $TargetFolder
+            LastError    = $LastError
+            UpdatedAt    = $now
+        } `
+        -As "SingleValue")
 }
 
 function Get-MigrationFileFingerprint {
@@ -1202,11 +1345,11 @@ function Get-MigrationFilesToProcess {
     )
 
     $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
-    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (Status = 'Uploading' OR AttemptCount < @MaxAttemptsPerFile)" } else { "" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (f.Status = 'Uploading' OR f.AttemptCount < @MaxAttemptsPerFile)" } else { "" }
 
     return @(Invoke-SqliteQuery `
         -DataSource $DatabasePath `
-        -Query "SELECT * FROM Files WHERE Status IN $statusFilter AND Id > @AfterId $attemptFilter ORDER BY Id LIMIT @BatchSize;" `
+        -Query "SELECT f.* FROM Files f LEFT JOIN Folders d ON d.TargetFolder = f.TargetFolder WHERE f.Status IN $statusFilter AND f.Id > @AfterId $attemptFilter AND COALESCE(d.Status, 'Pending') <> 'Failed' ORDER BY f.Id LIMIT @BatchSize;" `
         -SqlParameters @{
             AfterId            = $AfterId
             BatchSize          = $BatchSize
@@ -1226,11 +1369,11 @@ function Get-MigrationFilesToProcessCount {
     )
 
     $statusFilter = if ($IncludeFailed) { "('Pending', 'Failed', 'Uploading')" } else { "('Pending', 'Uploading')" }
-    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (Status = 'Uploading' OR AttemptCount < @MaxAttemptsPerFile)" } else { "" }
+    $attemptFilter = if ($MaxAttemptsPerFile -gt 0) { "AND (f.Status = 'Uploading' OR f.AttemptCount < @MaxAttemptsPerFile)" } else { "" }
 
     return [int](Invoke-SqliteQuery `
         -DataSource $DatabasePath `
-        -Query "SELECT COUNT(*) FROM Files WHERE Status IN $statusFilter $attemptFilter;" `
+        -Query "SELECT COUNT(*) FROM Files f LEFT JOIN Folders d ON d.TargetFolder = f.TargetFolder WHERE f.Status IN $statusFilter $attemptFilter AND COALESCE(d.Status, 'Pending') <> 'Failed';" `
         -SqlParameters @{ MaxAttemptsPerFile = $MaxAttemptsPerFile } `
         -As "SingleValue")
 }

@@ -50,7 +50,7 @@ Dans ce scenario:
 - `MaxAttemptsPerFile` evite de retenter indefiniment le meme fichier;
 - `MaxTotalErrors` arrete la migration si trop d'erreurs apparaissent pendant une execution.
 - `ParallelUploads` execute plusieurs uploads simultanement;
-- `AssumeDestinationEmpty` controle si l'existence distante est verifiee avant chaque upload;
+- `AssumeDestinationEmpty=false` charge une fois la liste des fichiers distants de chaque dossier et utilise un cache partage pendant le run;
 - `TreatTenantSyncExclusionsAsBlocked` permet, si necessaire, de traiter les exclusions de synchronisation OneDrive comme une politique de migration;
 - `IncludeHiddenItems` controle si les fichiers caches/systeme sont inclus dans l'inventaire;
 - `ProcessingBatchSize` controle les lots de hash et les pages SQLite, sans limiter l'enumeration locale complete.
@@ -297,10 +297,17 @@ Reprendre la migration sans repartir de zero.
 
 Ce que fait le script:
 
+- extrait les dossiers cibles uniques depuis SQLite;
+- verifie ou cree chaque dossier avant de lancer les workers;
+- charge une fois les noms de fichiers distants de chaque dossier lorsque `AssumeDestinationEmpty=false`;
 - reprend les fichiers `Pending`;
 - reprend aussi les fichiers `Failed`, si leur nombre de tentatives le permet;
 - conserve les fichiers restes en `Uploading` et force leur verification distante;
 - conserve les fichiers deja `Uploaded` ou `SkippedExists`.
+
+Si un dossier est supprime apres la preparation mais avant un upload, le worker confirme son absence, le recree sous verrou, puis retente l'upload une fois. Les autres workers attendent cette reparation au lieu de recreer le meme dossier en parallele.
+
+Si la preparation initiale d'un dossier echoue, ses fichiers passent en `Failed` sans repeter la meme erreur reseau pour chaque fichier. Apres correction des droits ou du chemin, `-Resume` retente la preparation du dossier avant de reprendre ses fichiers.
 
 Resultat attendu:
 
@@ -625,6 +632,7 @@ Pour une migration standard:
 | Beaucoup de `BlockedExtension` | Exporter les rapports et verifier `migration_blocked_extensions_*.csv`. |
 | Delta silencieux apres la preparation | Verifier les lignes `Application delta SQLite`; elles indiquent l'ecriture transactionnelle en base. |
 | Trop d'erreurs d'upload | Exporter les erreurs, corriger la cause, puis lancer `-ResetFailed` et `-Resume`. |
+| Dossier supprime pendant la migration | Le script le recree et retente l'upload une fois. Verifier les lignes `[DOSSIER]` si la reparation echoue. |
 | Migration trop longue | Tester `-MaxFiles`, ajuster `ParallelUploads`, et surveiller les logs SharePoint. |
 | Fichiers supprimes localement encore presents dans SharePoint | Lancer `-DeltaInventory -IncludeDeleted`, puis `-Migrate -DeleteRemoteMissing`. |
 
